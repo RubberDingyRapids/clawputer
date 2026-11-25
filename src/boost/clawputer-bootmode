@@ -1,0 +1,32 @@
+#!/bin/bash
+# clawputer-bootmode enter : next boot ONLY uses gpu_mem=16 (more RAM, camera off), reboot now
+# clawputer-bootmode exit  : reboot (the original setting was already restored at boot)
+# clawputer-bootmode reset : restore the original gpu_mem (runs at every boot)
+CFG=/boot/firmware/config.txt
+[ -f "$CFG" ] || CFG=/boot/config.txt
+SAVE=/var/lib/clawputer/gpu_mem.orig
+case "${1:-}" in
+  enter)
+    mkdir -p "$(dirname "$SAVE")"
+    if [ ! -f "$SAVE" ]; then
+      grep -m1 '^gpu_mem=' "$CFG" > "$SAVE" || echo "none" > "$SAVE"
+    fi
+    if grep -q '^gpu_mem=' "$CFG"; then
+      sed -i 's/^gpu_mem=.*/gpu_mem=16/' "$CFG"
+    else
+      echo "gpu_mem=16" >> "$CFG"
+    fi
+    sync; systemctl reboot ;;
+  exit) sync; systemctl reboot ;;
+  reset)
+    [ -f "$SAVE" ] || exit 0
+    orig=$(cat "$SAVE")
+    if [ "$orig" = none ]; then
+      sed -i '/^gpu_mem=16$/d' "$CFG"
+    else
+      sed -i "s/^gpu_mem=16$/$orig/" "$CFG"
+    fi
+    rm -f "$SAVE"; sync
+    echo "gpu_mem restored for next boot" ;;
+  *) echo "usage: clawputer-bootmode enter|exit|reset"; exit 1 ;;
+esac

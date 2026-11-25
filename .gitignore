@@ -1,0 +1,5 @@
+build/
+dist/
+build-shots/
+__pycache__/
+*.pyc

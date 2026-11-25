@@ -1,0 +1,35 @@
+{
+  "package_name": "clawputer",
+  "version": "0.1.0",
+  "app_name": "Clawputer",
+  "bin_name": "clawputer",
+  "description": "Pocket chat app for Claude Code on CardputerZero (unofficial)",
+  "store": {
+    "summary": "Claude Code in your pocket: a chat app made for the Cardputer (unofficial)",
+    "description": "Clawputer is a pocket chat app for Anthropic's Claude Code, built for the CardputerZero's 320x170 screen and keyboard.\n\n- Clean chat view: tool calls squashed to one line, command output and code in tidy boxes\n- Permission prompts (y / n / always) and Claude's multiple-choice questions\n- Chat history (F2), settings (F1): model, effort, permissions, font size and more\n- Drafts autosave, messages queue while Claude is busy\n- Easy first-run setup: installs Claude Code with Anthropic's official installer, then sign in by scanning a QR code with your phone, no typing long codes\n- Remote mode: run Claude on your PC over SSH (works with Tailscale) and use the Cardputer as the screen, fast and with no RAM limits\n- Optional RAM boost: pauses background services while Claude runs on the Cardputer\n- Terminal mode for the full Claude Code interface\n\nNeeds a Claude subscription (Pro/Max) or an Anthropic Console account. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic.",
+    "categories": ["AI", "Development"],
+    "screenshots": [
+      "store/screenshots/1-chat.png",
+      "store/screenshots/2-permission.png",
+      "store/screenshots/3-question.png",
+      "store/screenshots/4-settings.png",
+      "store/screenshots/5-history.png",
+      "store/screenshots/6-signin.png"
+    ],
+    "icon": "store/icon.png",
+    "license": "MIT",
+    "source_repo": "https://github.com/RubberDingyRapids/clawputer",
+    "author": { "github": "RubberDingyRapids", "display_name": "RubberDingyRapids" },
+    "share_code": "CLAW",
+    "permissions": {
+      "camera": false,
+      "microphone": false,
+      "imu": false,
+      "network": true,
+      "additional_hardware": false,
+      "background_service": false,
+      "external_display": false
+    },
+    "locales": {}
+  }
+}

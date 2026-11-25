@@ -1,0 +1,28 @@
+#!/bin/bash
+# clawputer-boost on  : pause RAM-hungry background services while Claude runs on the Cardputer
+# clawputer-boost off : bring back exactly what was paused
+# The service list lives in /etc/clawputer/boost.conf (edit to taste).
+CONF=/etc/clawputer/boost.conf
+STATE=/run/clawputer-boost.stopped
+SERVICES="lightdm cups cups-browsed avahi-daemon udisks2 accounts-daemon packagekit"
+[ -r "$CONF" ] && . "$CONF"
+case "${1:-}" in
+  on)
+    : > "$STATE"
+    for s in $SERVICES; do
+      systemctl is-active --quiet "$s" && echo "$s" >> "$STATE"
+    done
+    systemctl stop avahi-daemon.socket 2>/dev/null || true
+    xargs -r systemctl stop < "$STATE" 2>/dev/null || true
+    sync; echo 1 > /proc/sys/vm/drop_caches
+    ;;
+  off)
+    [ -f "$STATE" ] || exit 0
+    systemctl start avahi-daemon.socket 2>/dev/null || true
+    # the desktop only comes back if an HDMI screen is plugged in
+    grep -qx connected /sys/class/drm/card*-HDMI-A-*/status 2>/dev/null || sed -i '/^lightdm$/d' "$STATE"
+    xargs -r systemctl --no-block start < "$STATE" 2>/dev/null || true
+    rm -f "$STATE"
+    ;;
+  *) echo "usage: clawputer-boost on|off"; exit 1 ;;
+esac
