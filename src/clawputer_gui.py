@@ -1122,82 +1122,88 @@ class App:
 
     # -- mode screen: where should claude run? (menu mode) --
     MODE_DESC = {
-        "local": "runs here. claude uses ~200MB of the ~350MB ram, so it's slower. ram boost recommended.",
+        "local": "runs here on the cardputer. claude uses ~200MB of the ~350MB ram, so a ram boost is recommended.",
         "pc": "runs on your pc over ssh: fast, no ram limits. the pc must be on.",
-        "terminal": "the full claude code interface (pageup scrolls).",
-        "boost": "pauses background stuff while claude runs, plus an optional reboot for +112MB. asks your password once.",
-        "reboot": "one-boot trick: moves gpu memory to ram (+112MB). camera is off until the next reboot.",
-        "quit": "back to the launcher.",
     }
 
     def open_mode(self, first=False):
         inst, gpu = boost_state()
-        self.modescr = {"first": first, "boost": inst, "gpu": gpu, "prompt": None, "sel": 0}
+        self.modescr = {"first": first, "boost": inst, "gpu": gpu, "ram": None, "sel": 0}
         last = {"gui": "local", "remote": "pc"}.get(read_file(os.path.join(CONF, "ui")), None)
         last = last or read_file(os.path.join(CONF, "ui")) or "local"
         keys = [i[0] for i in self.mode_items()]
         self.modescr["sel"] = keys.index(last) if last in keys else 0
-        if os.environ.pop("CLAWPUTER_AFTER", "") == "local":
-            self.mode_pick("local")
         self.dirty = True
 
     def mode_items(self):
-        m = self.modescr
         rc = setup.remote_cfg()
-        items = [("local", "on this cardputer"),
-                 ("pc", "on my pc" if rc else "on my pc  (set up)"),
-                 ("terminal", "terminal (default claude code)")]
-        if not m["boost"]:
-            items.append(("boost", "set up ram boost"))
-        elif m["gpu"] > 16:
-            items.append(("reboot", "reboot for +112MB ram"))
-        items.append(("quit", "quit"))
-        return items
+        return [("local", "on this cardputer"),
+                ("pc", "on my pc" if rc else "on my pc  (set up)")]
+
+    def ram_options(self):
+        """-> [(key, label, description, choice)] for the 'on this cardputer' RAM menu"""
+        m = self.modescr
+        pw = " asks your password once." if not m["boost"] else ""
+        return [
+            ("max", "max ram boost (recommended)",
+             "pauses background stuff, then restarts with gpu memory moved to ram (+112MB, "
+             "camera off until the next restart). open Clawputer again after." + pw,
+             "reboot" if m["boost"] else "boost-setup-max"),
+            ("boost", "ram boost",
+             "pauses background stuff (desktop, printing etc) while claude runs, no restart." + pw,
+             "local" if m["boost"] else "boost-setup-local"),
+            ("plain", "just run it",
+             "no changes. slower, and big tasks may run out of memory.", "local-noboost"),
+        ]
 
     def mode_key(self, k):
         m = self.modescr
-        if m["prompt"]:
-            _, _, yes, no = m["prompt"]
-            if k in ("y", "Y", "enter"):
-                self.choose(yes)
-            elif k in ("n", "N"):
-                self.choose(no)
+        if m["ram"] is not None:                        # the RAM options menu
+            opts = self.ram_options()
+            if k in ("f", "F", "up"):
+                m["ram"] = (m["ram"] - 1) % len(opts)
+            elif k in ("x", "X", "down"):
+                m["ram"] = (m["ram"] + 1) % len(opts)
+            elif k in ("1", "2", "3"):
+                m["ram"] = int(k) - 1
+                self.pick_ram()
+            elif k == "enter":
+                self.pick_ram()
             elif k == "esc":
-                m["prompt"] = None
+                m["ram"] = None
             return
         items = self.mode_items()
         keys = [i[0] for i in items]
-        hot = {"g": "local", "r": "pc", "t": "terminal", "b": "boost", "q": "quit"}
+        hot = {"g": "local", "c": "local", "r": "pc", "p": "pc"}
         if k in ("f", "F", "up"):
             m["sel"] = (m["sel"] - 1) % len(items)
         elif k in ("x", "X", "down"):
             m["sel"] = (m["sel"] + 1) % len(items)
         elif k == "enter":
             self.mode_pick(keys[m["sel"]])
-        elif k in hot and hot[k] in keys:
+        elif k in hot:
             m["sel"] = keys.index(hot[k])
             self.mode_pick(hot[k])
-        elif k in ("esc", "ctrl+q"):
+        elif k in ("q", "Q", "esc", "ctrl+q"):
             self.choose("quit")
+
+    def pick_ram(self):
+        key, _, _, choice = self.ram_options()[self.modescr["ram"]]
+        try:
+            with open(os.path.join(CONF, "ram"), "w") as f:
+                f.write(key)
+        except OSError:
+            pass
+        self.choose(choice)
 
     def mode_pick(self, key):
         m = self.modescr
-        if key == "local" and not m["boost"]:
-            m["prompt"] = ("RAM boost recommended", [
-                "claude uses ~200MB; the cardputer has",
-                "~350MB. ram boost pauses background",
-                "stuff while claude runs, and can",
-                "reboot with +112MB. it asks your",
-                "password once."], "boost-setup-local", "local")
-            m["prompt_keys"] = "y set it up    n not now    esc back"
-        elif key == "local" and m["gpu"] > 16:
-            m["prompt"] = ("More RAM?", [
-                "reboot now with gpu memory moved",
-                "to ram (+112MB)? the camera is off",
-                "until the next reboot.",
-                "",
-                "after it restarts, open Clawputer."], "reboot", "local")
-            m["prompt_keys"] = "y reboot    n just go    esc back"
+        if key == "local":
+            if m["boost"] and m["gpu"] <= 16:
+                self.choose("local")                     # already max-boosted this boot
+            last = read_file(os.path.join(CONF, "ram")) or "max"
+            keys = [o[0] for o in self.ram_options()]
+            m["ram"] = keys.index(last) if last in keys else 0
         elif key == "pc" and not setup.remote_cfg():
             self.pc_after_setup = True
             self.setup = setup.Setup(self, remote_only=True)
@@ -1209,9 +1215,10 @@ class App:
             os.makedirs(CONF, exist_ok=True)
             with open(os.path.join(CONF, "choice"), "w") as f:
                 f.write(choice)
-            if choice in ("local", "pc", "terminal"):
+            ui = "pc" if choice == "pc" else ("local" if choice != "quit" else None)
+            if ui:
                 with open(os.path.join(CONF, "ui"), "w") as f:
-                    f.write(choice)
+                    f.write(ui)
         except OSError as e:
             log("choice", e)
         raise SystemExit
@@ -1224,36 +1231,47 @@ class App:
         d.text((W - 4 - self.small.getlength(right), 3), right, font=self.small, fill=DIM)
         d.line((0, 15, W, 15), fill=BAR)
         items = self.mode_items()
-        y = 19
+        y = 21
         for i, (key, label) in enumerate(items):
             on = i == m["sel"]
             if on:
-                d.rectangle((4, y - 1, W - 4, y + 11), fill=(55, 45, 50))
-            d.text((10, y), ("> " if on else "  ") + label, font=self.small, fill=FG if on else DIM)
-            y += 13
+                d.rectangle((4, y - 2, W - 4, y + 12), fill=(55, 45, 50))
+            d.text((10, y), ("> " if on else "  ") + label, font=self.font, fill=FG if on else DIM)
+            y += 16
         desc = self.MODE_DESC.get(items[m["sel"]][0], "")
         if items[m["sel"]][0] == "pc" and setup.remote_cfg():
             c = setup.remote_cfg()
             desc += " pc: %s@%s" % (c["user"], c["host"])
-        y += 3
+        y += 4
         for ln in textwrap.wrap(desc, 56)[:3]:
             d.text((8, y), ln, font=self.small, fill=DIM)
             y += 11
         if m["boost"] and m["gpu"] <= 16:
-            st, col = "boost active · +112MB · ram free %dMB" % mem_free_mb(), (120, 210, 130)
+            st, col = "max ram boost active · +112MB · %dMB free" % mem_free_mb(), (120, 210, 130)
         else:
-            st, col = "ram free %dMB · boost %s" % (mem_free_mb(), "on" if m["boost"] else "off"), DIM
+            st, col = "ram free %dMB" % mem_free_mb(), DIM
         d.text((6, H - 24), st, font=self.small, fill=col)
-        d.text((6, H - 12), "f/x move  enter pick  g r t b hotkeys  q quit", font=self.small, fill=DIM)
-        if m["prompt"]:
-            ptitle, plines, _, _ = m["prompt"]
-            bh = len(plines) * 12 + 34
+        d.text((6, H - 12), "f/x move  enter pick  q quit", font=self.small, fill=DIM)
+        if m["ram"] is not None:
+            opts = self.ram_options()
+            desc = textwrap.wrap(opts[m["ram"]][2], 52)[:4]
+            bh = 18 + len(opts) * 14 + 4 + len(desc) * 11 + 16
             top = max(2, (H - bh) // 2)
-            d.rectangle((10, top, W - 10, top + bh), fill=(25, 25, 35), outline=ACCENT)
-            d.text((18, top + 4), ptitle, font=self.small, fill=ACCENT)
-            for i, ln in enumerate(plines):
-                d.text((18, top + 18 + i * 12), ln, font=self.small, fill=FG)
-            hint = m.get("prompt_keys", "y yes   n no   esc back")
+            d.rectangle((8, top, W - 8, top + bh), fill=(25, 25, 35), outline=ACCENT)
+            d.text((16, top + 4), "running on the cardputer: ram", font=self.small, fill=ACCENT)
+            yy = top + 18
+            for i, (_, label, _, _) in enumerate(opts):
+                on = i == m["ram"]
+                if on:
+                    d.rectangle((12, yy - 1, W - 12, yy + 11), fill=(55, 45, 50))
+                d.text((18, yy), ("> " if on else "  ") + "%d %s" % (i + 1, label), font=self.small,
+                       fill=FG if on else DIM)
+                yy += 14
+            yy += 4
+            for ln in desc:
+                d.text((18, yy), ln, font=self.small, fill=DIM)
+                yy += 11
+            hint = "f/x move  enter pick  esc back"
             d.text(((W - self.small.getlength(hint)) // 2, top + bh - 13), hint, font=self.small, fill=ACCENT)
         self.fb.write(img)
         self.dirty = False

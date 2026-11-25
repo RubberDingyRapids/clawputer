@@ -42,9 +42,10 @@ a = g.App([])
 a.entries.clear(); a.lines_cache = None
 # mode screen
 a.open_mode(first=True); save(a, "m1_first.png")
-a.modescr["first"] = False; a.modescr["boost"] = False; a.mode_pick("local"); save(a, "m2_boost_prompt.png")
-a.modescr["prompt"] = None; a.modescr["boost"] = True; a.modescr["gpu"] = 128; a.mode_pick("local"); save(a, "m3_reboot_prompt.png")
-a.modescr["prompt"] = None; a.modescr["gpu"] = 16; a.modescr["sel"] = 1; save(a, "m4_boost_active.png")
+a.modescr["first"] = False; a.modescr["boost"] = False
+a.modescr["ram"] = 0; save(a, "m2_ram_max.png")
+a.modescr["ram"] = 2; save(a, "m3_ram_plain.png")
+a.modescr["ram"] = None; a.modescr["boost"] = True; a.modescr["gpu"] = 16; a.modescr["sel"] = 1; save(a, "m4_boost_active.png")
 a.modescr = None
 
 # install progress (fake tracker state)

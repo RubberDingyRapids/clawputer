@@ -27,7 +27,6 @@ and built-in keyboard.
 - **Remote mode**: run Claude on your PC over SSH (Tailscale works great) and use the
   Cardputer as the screen; fast, no RAM limits. Set up with one short command on the PC
 - **Optional RAM boost** for running Claude on the Cardputer itself (see below)
-- **Terminal mode**: the full Claude Code interface in tmux (PageUp scrolls)
 
 ## Keys (chat)
 
@@ -47,8 +46,8 @@ and built-in keyboard.
 Claude Code wants ~200MB of RAM; the CardputerZero has ~350MB usable. It works, but it's
 tight. Two ways to make it better:
 
-- **RAM boost** (optional, local mode): offered when you pick *on this cardputer*; enter your
-  password once. It installs two small root helpers and a sudoers rule so Clawputer can pause
+- **RAM boost** (optional): when you pick *on this cardputer* you choose **max ram boost**
+  (recommended), **ram boost** or **just run it**. Boosting asks your password once. It installs two small root helpers and a sudoers rule so Clawputer can pause
   background services (desktop, printing, etc., list in `/etc/clawputer/boost.conf`) while
   Claude runs, and offer a one-boot reboot that moves GPU memory to RAM (+~112MB, camera off
   for that boot; the next reboot is back to normal automatically). Undo with

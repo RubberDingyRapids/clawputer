@@ -1,7 +1,7 @@
 #!/bin/bash
 # Clawputer launcher (CardputerZero).
 # Shows the GUI mode screen (first run: install Claude Code + sign in), then runs Claude where
-# you picked: on this Cardputer (chat GUI), on your PC over SSH (chat GUI), or the terminal.
+# you picked: on this Cardputer or on your PC over SSH, in the chat GUI.
 # The only terminal bits are the RAM-boost password prompt and its reboot.
 SHARE=/usr/share/clawputer
 CONF="$HOME/.config/clawputer"; mkdir -p "$CONF"
@@ -10,7 +10,6 @@ WARN="$CONF/esc_warning"
 BOOST=/usr/local/sbin/clawputer-boost
 BOOTMODE=/usr/local/sbin/clawputer-bootmode
 CLAUDE="$HOME/.local/bin/claude"; [ -x "$CLAUDE" ] || CLAUDE=$(command -v claude || echo "$CLAUDE")
-TMUX_SOCK=clawputer
 
 gpu_mb(){ vcgencmd get_mem gpu 2>/dev/null | tr -dc 0-9; }
 boost_ok(){ [ -x "$BOOST" ] && sudo -n -l "$BOOST" on >/dev/null 2>&1; }
@@ -44,7 +43,7 @@ run_gui(){
   printf '\033[?25h'; flush_keys
 }
 
-# ---------------- stage 2: run Claude (inside tmux for terminal mode) ----------------
+# ---------------- stage 2: run Claude on the Cardputer (with the RAM boost if chosen) ----------------
 if [ "${CLAWPUTER_STAGE:-}" = run ]; then
   GUARD=; HUPPED=
   restore(){
@@ -88,25 +87,19 @@ if [ "${CLAWPUTER_STAGE:-}" = run ]; then
   fi
   export DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAWPUTER_CHECKED=1
   mkdir -p "$HOME/clawputer"; cd "$HOME/clawputer" || exit 1
-  if [ "${CLAWPUTER_UI:-}" = gui ]; then
-    run_gui "$@"
-  else
-    "$CLAUDE" "$@"
-  fi
+  run_gui "$@"
   exit 0
 fi
 
 # ---------------- stage 1: mode screen ----------------
 clear; echo "starting clawputer..."
 show_warning
-AFTER=
 while true; do
   rm -f "$CONF/choice"
-  CLAWPUTER_AFTER="$AFTER" run_gui --menu
-  AFTER=
+  run_gui --menu
   CHOICE=$(cat "$CONF/choice" 2>/dev/null || echo quit)
   case "$CHOICE" in
-    boost-setup|boost-setup-local)
+    boost-setup-max|boost-setup-local)
       clear
       echo "== RAM boost setup =="
       echo "installs 2 small helpers so clawputer"
@@ -115,15 +108,17 @@ while true; do
       echo "your password:"
       echo
       if sudo "$SHARE/boost/enable-boost.sh"; then
-        echo "done."; [ "$CHOICE" = boost-setup-local ] && AFTER=local
-      else
-        echo "not enabled."
+        if [ "$CHOICE" = boost-setup-max ]; then
+          echo; echo "restarting with more ram..."; echo "open Clawputer again after it restarts."
+          sleep 2; sudo -n "$BOOTMODE" enter; sleep 60; exit 0
+        fi
+        CHOICE=local; break
       fi
-      sleep 1; continue;;
+      echo "not enabled."; sleep 2; continue;;
     reboot)
-      clear; echo "rebooting with more ram..."; echo "open Clawputer again after it restarts."
+      clear; echo "restarting with more ram..."; echo "open Clawputer again after it restarts."
       sleep 2; sudo -n "$BOOTMODE" enter; sleep 60; exit 0;;
-    local|pc|terminal) break;;
+    local|local-noboost|pc) break;;
     *) clear; exit 0;;
   esac
 done
@@ -133,11 +128,6 @@ if [ "$CHOICE" = pc ]; then
   run_gui; exit 0
 fi
 
-boost_ok && export CLAWPUTER_BOOST=1
-export CLAWPUTER_STAGE=run
-if [ "$CHOICE" = terminal ]; then
-  export CLAWPUTER_UI=terminal
-  exec tmux -L "$TMUX_SOCK" -f "$SHARE/tmux.conf" new-session -A -s clawputer "$0" "$@"
-fi
-export CLAWPUTER_UI=gui
+[ "$CHOICE" = local ] && boost_ok && export CLAWPUTER_BOOST=1
+export CLAWPUTER_STAGE=run CLAWPUTER_UI=gui
 exec "$0" "$@"

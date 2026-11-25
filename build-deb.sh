@@ -23,7 +23,7 @@ Type=Application
 EOF
 chmod 644 "$A/applications/clawputer.desktop"
 
-install -m 644 src/clawputer_gui.py src/clawputer_setup.py src/CLAUDE.md src/CLAUDE.remote.md src/tmux.conf VERSION "$S/"
+install -m 644 src/clawputer_gui.py src/clawputer_setup.py src/CLAUDE.md src/CLAUDE.remote.md VERSION "$S/"
 install -m 755 src/boost/clawputer-boost src/boost/clawputer-bootmode src/boost/enable-boost.sh src/boost/disable-boost.sh "$S/boost/"
 install -m 644 LICENSE "$PKG/usr/share/doc/clawputer/copyright"
 
@@ -35,7 +35,7 @@ Maintainer: RubberDingyRapids <RubberDingyRapids@users.noreply.github.com>
 Section: APPLaunch
 Priority: optional
 Homepage: https://github.com/RubberDingyRapids/clawputer
-Depends: python3, python3-pil, python3-numpy, python3-qrcode, tmux, curl, openssh-client, fonts-dejavu-core
+Depends: python3, python3-pil, python3-numpy, python3-qrcode, curl, openssh-client, fonts-dejavu-core
 Description: Pocket chat app for Claude Code on CardputerZero (unofficial)
  A compact chat GUI for Anthropic's Claude Code made for the CardputerZero's
  320x170 screen and keyboard: code boxes, chat history, settings, permission
