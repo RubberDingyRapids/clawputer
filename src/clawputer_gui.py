@@ -615,7 +615,10 @@ class App:
                 self.start_claude(resume=self.session_id)
             secs = (time.time() - self.t_start) if self.t_start else 0
             if m.get("is_error") or m.get("subtype") not in ("success", None):
-                self.add("err", "✗ " + str(m.get("result") or m.get("subtype"))[:200])
+                err = str(m.get("result") or m.get("subtype"))
+                self.add("err", "✗ " + err[:200])
+                if re.search(r"log ?in|auth|401|api key|oauth|credential", err, re.I) and not REMOTE:
+                    self.add("info", "  sign-in problem? F2 > sign out of claude, then sign in again.")
             self.status = "ready · %.0fs" % secs
             if self.queue:
                 self.lines_cache = None

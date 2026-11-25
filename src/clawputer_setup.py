@@ -60,6 +60,22 @@ def auth_status():
         return {}
 
 
+def quick_signed_in():
+    """fast (no claude start-up) check for saved Claude credentials; the real check
+    (`claude auth status`) has to load the 385MB claude binary, which is slow after a reboot"""
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    if os.path.exists(os.path.join(cfg, ".credentials.json")):
+        return True
+    for p in (os.path.join(cfg, ".claude.json"), os.path.expanduser("~/.claude.json")):
+        try:
+            d = json.load(open(p))
+            if d.get("oauthAccount") or d.get("primaryApiKey"):
+                return True
+        except (OSError, ValueError):
+            pass
+    return False
+
+
 def lan_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -395,6 +411,17 @@ class InstallTracker:
             else:
                 self.log = (self.log + [line])[-3:]
 
+    def copying(self):
+        """-> bytes copied so far while the installer copies the binary into place, else None"""
+        vdir = os.path.expanduser("~/.local/share/claude/versions")
+        try:
+            tmps = [f for f in os.listdir(vdir) if ".tmp." in f]
+        except OSError:
+            return None
+        if not tmps:
+            return None
+        return max(os.path.getsize(os.path.join(vdir, f)) for f in tmps)
+
     def download(self):
         """-> (bytes_so_far, expected_or_None) while the binary is downloading, else None"""
         try:
@@ -423,6 +450,15 @@ class InstallTracker:
                     out.append(("__bar__", min(1.0, got / exp), "%.0fMB / %.0fMB" % (mb, exp / 1048576)))
                 else:
                     out.append(("  %.0fMB downloaded" % mb, "dim"))
+        cur = self.steps[-1]
+        if not cur[1] and cur[0] != "downloading claude code" and cur[0] != "getting latest version":
+            # the installer copies + checks the ~385MB program here; slow on this hardware
+            copied = self.copying()
+            total = self.sizes.get("plain")
+            if copied and total:
+                out.append(("__bar__", min(1.0, copied / total),
+                            "%.0fMB / %.0fMB" % (copied / 1048576, total / 1048576)))
+            out.append(("  big file (~%dMB): can take a few minutes" % ((total or 385 * 1048576) // 1048576), "dim"))
         out += [("  " + l[:46], "dim") for l in self.log]
         return out
 
@@ -455,6 +491,9 @@ class Setup:
             self.open_helper()
         elif not claude_installed():
             self.step = "install"
+        elif quick_signed_in():
+            self.step = "check"
+            self.finished = True             # saved login found: skip the slow check
         else:
             self.start_check()
 

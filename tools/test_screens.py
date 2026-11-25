@@ -61,6 +61,9 @@ a.setup = s; save(a, "i1_download.png")
 t.download = lambda: None
 t.feed("Setting up Claude Code...\nChecking installation...\nInstalling Claude Code native build latest...\n  fetching manifest\n  verifying checksum\n  linking ~/.local/bin/claude\n")
 save(a, "i2_installing.png")
+t.copying = lambda: 230 * 1048576
+t.sizes["plain"] = 385 * 1048576
+save(a, "i3_copying.png")
 a.setup = None
 
 # remote setup (real helper, fake no-config)
