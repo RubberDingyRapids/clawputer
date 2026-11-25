@@ -17,15 +17,15 @@ and built-in keyboard.
 - **Chat view** built for a tiny screen: tool calls squashed to one line, command output and
   code blocks in single-line boxes, word wrap, scroll bar
 - **Permission prompts** (`y` / `n` / `a`lways) and Claude's **multiple-choice questions**
-- **Chat history** (F2), opens your last chat on start, delete old ones
-- **Settings** (F1): model, effort, permission mode, font size, tool output lines, Enter =
+- **Chat history** (F3), opens your last chat on start, delete old ones
+- **Settings** (F2): model, effort, permission mode, font size, tool output lines, Enter =
   send / new line, double-space full stop
 - **Drafts autosave**, messages typed while Claude is busy are queued in order
 - **Easy setup**: installs Claude Code with Anthropic's official installer, then sign in by
   **scanning a QR code with your phone** and pasting the code there (wifi, Tailscale, or
   straight to Claude's sign-in page)
 - **Remote mode**: run Claude on your PC over SSH (Tailscale works great) and use the
-  Cardputer as the screen; fast, no RAM limits. Guided setup page for Windows/macOS/Linux
+  Cardputer as the screen; fast, no RAM limits. Set up with one short command on the PC
 - **Optional RAM boost** for running Claude on the Cardputer itself (see below)
 - **Terminal mode**: the full Claude Code interface in tmux (PageUp scrolls)
 
@@ -37,8 +37,9 @@ and built-in keyboard.
 | Fn+F / Fn+X | scroll one line up / down |
 | Fn+Z / Fn+C | page up / down |
 | Esc | stop Claude's current reply, or clear the message box |
-| F1 / Ctrl+S | settings (`f`/`x` move, Enter open, Esc back) |
-| F2 / Ctrl+O | chats (`n` new, `d` delete) |
+| F1 | help (all the keys) |
+| F2 / Ctrl+S | settings (`f`/`x` move, Enter open, Esc back) |
+| F3 / Ctrl+O | chats (`n` new, `d` delete) |
 | Ctrl+Q or `/exit` | quit (`/new` starts a fresh chat) |
 
 ## Running on the Cardputer vs on a PC
@@ -46,15 +47,17 @@ and built-in keyboard.
 Claude Code wants ~200MB of RAM; the CardputerZero has ~350MB usable. It works, but it's
 tight. Two ways to make it better:
 
-- **RAM boost** (optional, local mode): in the Clawputer menu press `b` and enter your
+- **RAM boost** (optional, local mode): offered when you pick *on this cardputer*; enter your
   password once. It installs two small root helpers and a sudoers rule so Clawputer can pause
   background services (desktop, printing, etc., list in `/etc/clawputer/boost.conf`) while
   Claude runs, and offer a one-boot reboot that moves GPU memory to RAM (+~112MB, camera off
   for that boot; the next reboot is back to normal automatically). Undo with
   `sudo /usr/share/clawputer/boost/disable-boost.sh`.
-- **Remote mode**: F1 > *remote pc setup* shows a QR code to a setup page (open it on your
-  phone or PC) with the Cardputer's SSH key and per-OS steps. Claude then runs on your PC in
-  `~/clawputer` and the Cardputer is just the screen.
+- **Remote mode**: pick *on my pc* on the start screen. It shows **one short command** to type
+  into an admin PowerShell (or a Mac/Linux terminal) on the PC: it fetches a setup script from
+  the Cardputer that enables SSH with the Cardputer's key and reports the PC's address back,
+  so there's nothing to copy between devices. A QR code to a step-by-step page is there too.
+  Claude then runs on your PC in `~/clawputer` and the Cardputer is just the screen.
 
 ## Privacy & security notes
 

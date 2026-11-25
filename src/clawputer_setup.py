@@ -2,11 +2,11 @@
 Clawputer setup flows: install Claude Code, sign in (QR + phone web page), remote PC setup.
 
 A tiny web server (LAN only, random token in the URL, only while a setup screen is open)
-lets you do the fiddly bits from a phone or PC browser instead of the Cardputer keyboard:
+lets you do the fiddly bits from a phone or PC instead of the Cardputer keyboard:
   - sign in: open the Claude sign-in link on the phone, paste the code back into the page
-  - remote PC: copy this Cardputer's SSH key, follow per-OS steps, enter the PC's address
+  - remote PC: one short command on the PC fetches a setup script from the Cardputer, sets up
+    SSH with the Cardputer's key, and reports the PC's address back automatically
 """
-import base64
 import html
 import http.server
 import json
@@ -19,6 +19,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import urllib.request
 
 try:
     import qrcode
@@ -31,6 +32,10 @@ REMOTE_FILE = os.path.join(CONFIG_DIR, "remote.json")
 KEY_FILE = os.path.join(CONFIG_DIR, "remote_key")
 KNOWN_HOSTS = os.path.join(CONFIG_DIR, "known_hosts")
 INSTALL_CMD = "curl -fsSL https://claude.ai/install.sh | bash"
+RELEASES = "https://downloads.claude.ai/claude-code-releases"
+DOWNLOADS = os.path.expanduser("~/.claude/downloads")
+HELPER_PORT = 8765
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +82,7 @@ def tailscale_ip():
 
 
 def mode_footer(prefix, names, current, suffix):
-    """footer as (text, highlighted) segments, e.g. u: switch QR (wifi/tailscale/link)"""
+    """footer as (text, highlighted) segments, e.g. tab: switch QR (wifi/tailscale/link)"""
     segs = [(prefix, False)]
     for i, n in enumerate(names):
         if i:
@@ -151,7 +156,95 @@ def detect_remote(cfg):
     save_remote_cfg(cfg)
     if r2.returncode != 0:
         return False, "connected, but Claude Code isn't installed on the PC"
-    return True, "connected to %s (%s), claude found" % (cfg["host"], cfg["os"])
+    return True, "connected to %s (%s)" % (cfg["host"], cfg["os"])
+
+
+# ---------------------------------------------------------------------------
+# PC setup scripts (served to the PC by the Cardputer; key + reply address baked in)
+# ---------------------------------------------------------------------------
+WIN_SCRIPT = r'''# Clawputer: let this PC run Claude Code for your Cardputer. Run in an ADMIN PowerShell.
+$ErrorActionPreference = "Stop"
+$key  = "__KEY__"
+$back = "http://__BACK__/__TOK__/remote"
+$cpLan = "__CPLAN__"; $cpTs = "__CPTS__"
+function say($t, $c = "Gray") { Write-Host $t -ForegroundColor $c }
+say "== Clawputer PC setup ==" "DarkYellow"
+$me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+  say "Please run this in an ADMIN PowerShell (right-click PowerShell > Run as administrator)." "Red"; return }
+$user = $env:USERNAME
+
+say "1/5 SSH server..."
+$cap = Get-WindowsCapability -Online -Name "OpenSSH.Server*" | Select-Object -First 1
+if ($cap.State -ne "Installed") { say "    installing OpenSSH Server (can take a minute)"; Add-WindowsCapability -Online -Name $cap.Name | Out-Null }
+Set-Service sshd -StartupType Automatic; Start-Service sshd
+
+say "2/5 authorising the Cardputer's key..."
+$admins = (net localgroup administrators) 2>$null
+$isAdmin = [bool]($admins | Where-Object { $_ -eq $user -or $_ -like "*\$user" })
+if ($isAdmin) { $ak = "C:\ProgramData\ssh\administrators_authorized_keys" }
+else { New-Item -ItemType Directory -Force "$HOME\.ssh" | Out-Null; $ak = "$HOME\.ssh\authorized_keys" }
+if (-not (Test-Path $ak) -or -not (Select-String -Path $ak -SimpleMatch $key -Quiet)) { Add-Content -Path $ak -Value $key -Encoding ascii }
+if ($isAdmin) { icacls $ak /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F" | Out-Null }
+
+say "3/5 network + firewall..."
+Get-NetConnectionProfile | Where-Object { $_.NetworkCategory -eq "Public" } | ForEach-Object {
+  Set-NetConnectionProfile -InterfaceIndex $_.InterfaceIndex -NetworkCategory Private }
+if (-not (Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
+  New-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -DisplayName "OpenSSH Server (sshd)" -Enabled True `
+    -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -Profile Private | Out-Null }
+
+say "4/5 checking Claude Code + Python..."
+$claude = (Get-Command claude -ErrorAction SilentlyContinue) -or (Test-Path "$HOME\.local\bin\claude.exe")
+$py = Get-Command python -ErrorAction SilentlyContinue
+if (-not $claude) { say "    Claude Code not found. In a NORMAL PowerShell run:  irm https://claude.ai/install.ps1 | iex" "Yellow"
+                    say "    then run 'claude' once and sign in." "Yellow" }
+if (-not $py) { say "    Python not found (used for chat history): winget install -e --id Python.Python.3.12" "Yellow" }
+
+say "5/5 telling the Cardputer where this PC is..."
+$addr = $null
+$ts = "C:\Program Files\Tailscale\tailscale.exe"
+if ($cpTs -and (Test-Path $ts)) { $addr = (& $ts ip -4 2>$null | Select-Object -First 1) }
+if (-not $addr) {
+  $pre = ($cpLan -split "\.")[0..2] -join "."
+  $addr = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -like "$pre.*" } | Select-Object -First 1).IPAddress }
+if (-not $addr) { $addr = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254*" } | Select-Object -First 1).IPAddress }
+Invoke-RestMethod -Method Post -Uri $back -Body @{ host = $addr; user = $user; port = 22 } | Out-Null
+say "done! the Cardputer is testing the connection to $user@$addr now." "Green"
+'''
+
+UNIX_SCRIPT = r'''#!/bin/bash
+# Clawputer: let this computer run Claude Code for your Cardputer.
+KEY="__KEY__"
+BACK="http://__BACK__/__TOK__/remote"
+CPLAN="__CPLAN__"; CPTS="__CPTS__"
+echo "== Clawputer PC setup =="
+echo "1/4 authorising the Cardputer's key..."
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+grep -qxF "$KEY" ~/.ssh/authorized_keys 2>/dev/null || echo "$KEY" >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+echo "2/4 SSH server (may ask for your password)..."
+if [ "$(uname)" = Darwin ]; then
+  sudo systemsetup -setremotelogin on 2>/dev/null || echo "   turn on: System Settings > General > Sharing > Remote Login"
+else
+  command -v sshd >/dev/null || sudo apt-get install -y openssh-server || sudo dnf install -y openssh-server
+  sudo systemctl enable --now ssh 2>/dev/null || sudo systemctl enable --now sshd
+fi
+echo "3/4 checking Claude Code..."
+PATH="$HOME/.local/bin:$PATH" command -v claude >/dev/null || {
+  echo "   Claude Code not found: curl -fsSL https://claude.ai/install.sh | bash   (then run 'claude' and sign in)"; }
+command -v python3 >/dev/null || echo "   python3 not found (used for chat history)"
+echo "4/4 telling the Cardputer where this computer is..."
+ADDR=""
+[ -n "$CPTS" ] && command -v tailscale >/dev/null && ADDR=$(tailscale ip -4 2>/dev/null | head -1)
+if [ -z "$ADDR" ]; then
+  PRE=$(echo "$CPLAN" | cut -d. -f1-3)
+  if [ "$(uname)" = Darwin ]; then ADDR=$(ifconfig | awk -v p="$PRE." '$1=="inet" && index($2,p)==1 {print $2; exit}')
+  else ADDR=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep "^$PRE\." | head -1); fi
+fi
+curl -s -X POST --data-urlencode "host=$ADDR" --data-urlencode "user=$USER" -d port=22 "$BACK" >/dev/null
+echo "done! the Cardputer is testing the connection to $USER@$ADDR now."
+'''
 
 
 # ---------------------------------------------------------------------------
@@ -173,15 +266,18 @@ white-space:pre-wrap;word-break:break-all;font-size:13px}}
 <p class="dim">Unofficial Claude Code app for CardputerZero. This page is served by your
 Cardputer on your local network and closes when you leave the setup screen.</p></body></html>"""
 
+TOKEN_CHARS = "abcdefghjkmnpqrstuvwxyz23456789"   # no look-alikes (l/1, o/0, i)
+
 
 class Helper:
     """LAN-only HTTP helper. Pages are produced by callbacks; posts go into an event list."""
 
     def __init__(self):
-        self.token = secrets.token_urlsafe(6)
+        self.token = "".join(secrets.choice(TOKEN_CHARS) for _ in range(5))
         self.events = []
         self.lock = threading.Lock()
         self.pages = {}            # name -> callable() -> html body
+        self.raw = {}              # name -> callable(host) -> (content_type, text)
         helper = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -192,20 +288,25 @@ class Helper:
                 p = urllib.parse.urlparse(self.path).path.strip("/").split("/")
                 return p if p and p[0] == helper.token else None
 
-            def _send(self, body, code=200):
-                data = PAGE.format(body=body).encode()
+            def _send_bytes(self, data, ctype, code=200):
                 self.send_response(code)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(data)
+
+            def _send(self, body, code=200):
+                self._send_bytes(PAGE.format(body=body).encode(), "text/html; charset=utf-8", code)
 
             def do_GET(self):
                 p = self._parts()
                 if p is None:
                     return self._send("<p>Not found.</p>", 404)
                 name = p[1] if len(p) > 1 and p[1] else "main"
+                if name in helper.raw:
+                    ctype, text = helper.raw[name](self.headers.get("Host", ""))
+                    return self._send_bytes(text.encode(), ctype)
                 fn = helper.pages.get(name)
                 self._send(fn() if fn else "<p>Nothing to do here right now.</p>")
 
@@ -221,7 +322,10 @@ class Helper:
                 self._send('<p class="ok">Sent! Look at your Cardputer.</p>'
                            '<p><a class="btn" href="/%s/%s">back</a></p>' % (helper.token, p[1]))
 
-        self.server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), H)
+        try:                                   # a fixed port keeps the PC command short
+            self.server = http.server.ThreadingHTTPServer(("0.0.0.0", HELPER_PORT), H)
+        except OSError:
+            self.server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), H)
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
@@ -242,10 +346,92 @@ class Helper:
 
 
 # ---------------------------------------------------------------------------
+# installer progress (parses Anthropic's installer output + watches the download)
+# ---------------------------------------------------------------------------
+class InstallTracker:
+    def __init__(self):
+        self.t0 = time.time()
+        self.steps = [["getting latest version", False]]
+        self.log = []                     # detail lines for the current step
+        self.sizes = {}                   # "plain"/"zst" -> expected bytes
+        self.buf = ""
+        threading.Thread(target=self._fetch_sizes, daemon=True).start()
+
+    def _fetch_sizes(self):
+        try:
+            ver = urllib.request.urlopen(RELEASES + "/latest", timeout=15).read().decode().strip()
+            plat = "linux-arm64"
+            for kind, name in (("plain", "manifest.json"), ("zst", "manifest.zst.json")):
+                try:
+                    m = json.loads(urllib.request.urlopen("%s/%s/%s" % (RELEASES, ver, name), timeout=15).read())
+                    size = (m.get("platforms") or {}).get(plat, {}).get("size")
+                    if size:
+                        self.sizes[kind] = int(size)
+                except (OSError, ValueError):
+                    pass
+        except (OSError, ValueError):
+            pass
+
+    def _step(self, title):
+        for s in self.steps:
+            s[1] = True
+        self.steps.append([title, False])
+        self.log = []
+
+    def feed(self, text):
+        self.buf += ANSI.sub("", text).replace("\r", "\n")
+        *lines, self.buf = self.buf.split("\n")
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                continue
+            low = line.lower()
+            if line.endswith(("...", "…")):
+                self._step(line.rstrip(".…").strip().lower())
+            elif "complete" in low or line.startswith("✅") or line.startswith("✔"):
+                for s in self.steps:
+                    s[1] = True
+                self.log = [line]
+            else:
+                self.log = (self.log + [line])[-3:]
+
+    def download(self):
+        """-> (bytes_so_far, expected_or_None) while the binary is downloading, else None"""
+        try:
+            files = [f for f in os.listdir(DOWNLOADS) if f.startswith("claude-")]
+        except OSError:
+            return None
+        if not files:
+            return None
+        f = max(files, key=lambda n: os.path.getmtime(os.path.join(DOWNLOADS, n)))
+        size = os.path.getsize(os.path.join(DOWNLOADS, f))
+        exp = self.sizes.get("zst") if f.endswith(".zst") else self.sizes.get("plain")
+        return size, exp
+
+    def lines(self, dots):
+        dl = self.download()
+        if dl and len(self.steps) == 1:
+            self._step("downloading claude code")
+        out = []
+        for title, done in self.steps:
+            out.append((("✓ " if done else "▸ ") + title + ("" if done else dots), "ok" if done else "accent"))
+        if self.steps[-1][0] == "downloading claude code" and not self.steps[-1][1]:
+            if dl:
+                got, exp = dl
+                mb = got / 1048576
+                if exp:
+                    out.append(("__bar__", min(1.0, got / exp), "%.0fMB / %.0fMB" % (mb, exp / 1048576)))
+                else:
+                    out.append(("  %.0fMB downloaded" % mb, "dim"))
+        out += [("  " + l[:46], "dim") for l in self.log]
+        return out
+
+
+# ---------------------------------------------------------------------------
 # setup screens (drawn by the GUI; this class holds state + logic)
 # ---------------------------------------------------------------------------
 class Setup:
-    """step: install | installing | choose | signin | checking | done | remote | error"""
+    """step: check | install | installing | choose | signin | checking | remote | error"""
 
     def __init__(self, app, remote_only=False):
         self.app = app
@@ -253,14 +439,19 @@ class Setup:
         self.proc = None
         self.out = ""
         self.login_url = ""
-        self.qr_mode = 0           # index into qr_modes(): wifi page / tailscale page / claude link
+        self.qr_mode = 0           # sign-in: wifi page / tailscale page / claude link
+        self.rview = 0             # remote: command (wifi/tailscale) / QR (wifi/tailscale)
         self.msg = ""
         self.finished = False
         self.remote_msg = ""
+        self.remote_ok = False
         self._chk = None
         self.did_login = False
+        self.inst = None
+        self.who = ""
         if remote_only:
             self.step = "remote"
+            ensure_key()
             self.open_helper()
         elif not claude_installed():
             self.step = "install"
@@ -279,6 +470,14 @@ class Setup:
         self.helper.pages["main"] = self.page_signin
         self.helper.pages["code"] = self.page_signin
         self.helper.pages["remote"] = self.page_remote
+        self.helper.raw["win"] = lambda host: ("text/plain; charset=utf-8", self.script(WIN_SCRIPT, host))
+        self.helper.raw["unix"] = lambda host: ("text/plain; charset=utf-8", self.script(UNIX_SCRIPT, host))
+
+    def script(self, tmpl, host):
+        back = host or "%s:%d" % (lan_ip(), self.helper.port)
+        return (tmpl.replace("__KEY__", ensure_key()).replace("__BACK__", back)
+                .replace("__TOK__", self.helper.token).replace("__CPLAN__", lan_ip())
+                .replace("__CPTS__", tailscale_ip() or ""))
 
     def close(self):
         if self.helper:
@@ -298,35 +497,22 @@ class Setup:
                 "<button>Send to Cardputer</button></form>") % (html.escape(self.login_url), self.helper.token)
 
     def page_remote(self):
-        key = html.escape(ensure_key())
+        k = html.escape(ensure_key())
         c = remote_cfg() or {}
         status = html.escape(self.remote_msg or "not tested yet")
-        k = key
+        base = "http://%s:%d/%s" % (lan_ip(), self.helper.port, self.helper.token)
         return f"""
 <p>Run Claude on a PC and use the Cardputer as the screen. Fast, no RAM limits.
-The PC must be on, reachable over SSH (same network, or both on Tailscale), and have
-<b>Claude Code</b> installed and signed in.</p>
-<h2>1. This Cardputer's key</h2><pre id="k">{k}</pre>
+The PC needs <b>Claude Code</b> installed and signed in, and must be on the same network as the
+Cardputer (or both on Tailscale).</p>
+<h2>Easy way: one command on the PC</h2>
+<p><b>Windows</b>, in an <b>admin</b> PowerShell:</p><pre>irm {base}/win | iex</pre>
+<p><b>macOS / Linux</b>, in a terminal:</p><pre>curl -s {base}/unix | bash</pre>
+<p class="dim">It sets up SSH with this Cardputer's key and tells the Cardputer the PC's address.</p>
+<h2>Manual way</h2><p>This Cardputer's key:</p><pre id="k">{k}</pre>
 <button onclick="navigator.clipboard.writeText(document.getElementById('k').innerText)">Copy key</button>
-<h2>2. Set up the PC</h2>
-<p><b>Windows</b> (admin PowerShell):</p><pre>Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
-Set-Service sshd -StartupType Automatic; Start-Service sshd
-# if your account is an administrator:
-Add-Content C:\\ProgramData\\ssh\\administrators_authorized_keys "{k}"
-icacls C:\\ProgramData\\ssh\\administrators_authorized_keys /inheritance:r /grant Administrators:F /grant SYSTEM:F
-# otherwise: Add-Content $HOME\\.ssh\\authorized_keys "{k}"
-# Claude Code + Python (Python is used for chat history):
-irm https://claude.ai/install.ps1 | iex
-winget install Python.Python.3.12</pre>
-<p class="dim">Make sure the network is set to Private (Settings &gt; Network) so the firewall lets SSH in.</p>
-<p><b>macOS</b>: System Settings &gt; General &gt; Sharing &gt; Remote Login: on. Then in Terminal:</p>
-<pre>mkdir -p ~/.ssh && echo "{k}" &gt;&gt; ~/.ssh/authorized_keys
-curl -fsSL https://claude.ai/install.sh | bash</pre>
-<p><b>Linux</b>:</p><pre>sudo apt install openssh-server
-mkdir -p ~/.ssh && echo "{k}" &gt;&gt; ~/.ssh/authorized_keys
-curl -fsSL https://claude.ai/install.sh | bash</pre>
-<p class="dim">Then run <code>claude</code> once on the PC and sign in.</p>
-<h2>3. Tell the Cardputer where the PC is</h2>
+<p class="dim">Add it to the PC's SSH authorized keys (Windows admins:
+C:\\ProgramData\\ssh\\administrators_authorized_keys), enable the SSH server, then:</p>
 <form method="post" action="/{self.helper.token}/remote">
 <input name="host" placeholder="PC address: IP or Tailscale name" value="{html.escape(c.get('host', ''))}">
 <input name="user" placeholder="PC username" value="{html.escape(c.get('user', ''))}">
@@ -338,6 +524,7 @@ curl -fsSL https://claude.ai/install.sh | bash</pre>
     def start_install(self):
         self.step = "installing"
         self.out = ""
+        self.inst = InstallTracker()
         self.proc = subprocess.Popen(["bash", "-c", INSTALL_CMD], stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
         os.set_blocking(self.proc.stdout.fileno(), False)
@@ -351,10 +538,8 @@ curl -fsSL https://claude.ai/install.sh | bash</pre>
     def finish_check(self, st):
         if st.get("loggedIn"):
             self.who = st.get("email") or st.get("authMethod") or "signed in"
-            if self.did_login:
-                self.step = "done"           # show "you're in" after a fresh sign-in
-            else:
-                self.finished = True         # already signed in: straight to chat
+            self.close()
+            self.finished = True             # the GUI moves on to "where should claude run?"
         else:
             self.step = "choose"
 
@@ -375,6 +560,7 @@ curl -fsSL https://claude.ai/install.sh | bash</pre>
         code = code.strip()
         if not code or not self.proc or self.proc.poll() is not None:
             return
+        self.app.input = code                        # show it in the code box, however it arrived
         try:
             self.proc.stdin.write((code + "\n").encode())
             self.proc.stdin.flush()
@@ -395,10 +581,11 @@ curl -fsSL https://claude.ai/install.sh | bash</pre>
             port = 22
         cfg = {"host": host, "user": user, "port": port}
         save_remote_cfg(cfg)
-        self.remote_msg = "testing..."
+        self.remote_msg = "testing %s@%s..." % (user, host)
         self.app.dirty = True
         self.app.draw()
         ok, m = detect_remote(cfg)
+        self.remote_ok = ok
         self.remote_msg = ("✓ " if ok else "✗ ") + m
 
     def poll(self):
@@ -410,12 +597,16 @@ curl -fsSL https://claude.ai/install.sh | bash</pre>
             except (BlockingIOError, OSError):
                 chunk = None
             if chunk:
-                self.out += chunk.decode(errors="replace")
-                self.out = self.out[-4000:]
+                text = chunk.decode(errors="replace")
+                self.out = (self.out + text)[-4000:]
+                if self.inst:
+                    self.inst.feed(text)
                 changed = True
                 m = re.search(r"https://\S*(?:oauth|authorize)\S*", self.out)
                 if m and not self.login_url:
                     self.login_url = m.group(0)
+        if self.step == "installing":
+            changed = True                    # keep the progress bar / dots moving
         if self.proc and self.proc.poll() is not None:
             rc = self.proc.returncode
             self.proc = None
@@ -423,14 +614,17 @@ curl -fsSL https://claude.ai/install.sh | bash</pre>
             if self.step == "installing":
                 if rc == 0 and claude_installed():
                     self.start_check()
+                elif rc == 137:
+                    self.step, self.msg = "error", "install ran out of memory. close other apps, then enter to retry."
                 else:
                     self.step, self.msg = "error", "install failed (exit %d). check wifi, then enter to retry." % rc
             elif self.step in ("signin", "checking"):
                 st = auth_status()
                 if st.get("loggedIn"):
                     self.who = st.get("email") or "signed in"
-                    self.step = "done"
+                    self.app.input = ""
                     self.close()
+                    self.finished = True
                 else:
                     tail = [l for l in self.out.strip().splitlines() if l.strip()][-1:] or ["sign-in failed"]
                     self.step, self.msg = "error", tail[0][:120] + "  (enter = try again)"
@@ -478,14 +672,10 @@ curl -fsSL https://claude.ai/install.sh | bash</pre>
                 return
             if k == "enter":
                 self.send_code(self.app.input)
-                self.app.input = ""
             elif k == "backspace":
                 self.app.input = self.app.input[:-1]
             elif len(k) == 1:
                 self.app.input += k
-        elif s == "done":
-            if k in ("enter", " "):
-                self.finished = True
         elif s == "error":
             if k == "enter":
                 if claude_installed():
@@ -501,6 +691,7 @@ curl -fsSL https://claude.ai/install.sh | bash</pre>
                     self.remote_msg = "testing..."
                     self.app.draw()
                     ok, m = detect_remote(c)
+                    self.remote_ok = ok
                     self.remote_msg = ("✓ " if ok else "✗ ") + m
                 else:
                     self.remote_msg = "no PC saved yet"
@@ -509,10 +700,11 @@ curl -fsSL https://claude.ai/install.sh | bash</pre>
                     os.remove(REMOTE_FILE)
                 except OSError:
                     pass
+                self.remote_ok = False
                 self.remote_msg = "PC removed"
-            elif k in ("tab", "right", "left", "u"):
-                n = len(self.qr_modes(with_link=False))
-                self.qr_mode = (self.qr_mode + (-1 if k == "left" else 1)) % n
+            elif k in ("tab", "right", "left"):
+                n = len(self.remote_views())
+                self.rview = (self.rview + (-1 if k == "left" else 1)) % n
             elif k in ("esc", "enter", "q"):
                 self.close()
                 self.finished = True
@@ -534,9 +726,21 @@ curl -fsSL https://claude.ai/install.sh | bash</pre>
             return kind, self.login_url
         return kind, (self.helper.url(page, host) if self.helper else None)
 
+    def remote_views(self):
+        """remote screen views: (name, kind, host)  kind = cmd | qr"""
+        v = [("command", "cmd", lan_ip())]
+        ts = tailscale_ip()
+        if ts:
+            v.append(("cmd-ts", "cmd", ts))
+        v.append(("qr", "qr", lan_ip()))
+        if ts:
+            v.append(("qr-ts", "qr", ts))
+        return v
+
     # ---- drawing ----
     def lines(self):
-        """-> (title, [text lines], qr_text, footer)"""
+        """-> (title, [lines], qr_text, footer). A line is a str, (text, style) with style
+        ok/accent/dim/cmd, or ("__bar__", fraction, label)."""
         s = self.step
         dots = "." * (int(time.time() * 3) % 4)
         if s == "check":
@@ -550,8 +754,9 @@ curl -fsSL https://claude.ai/install.sh | bash</pre>
                      "y  install it now (~2 min, needs wifi)",
                      "q  quit"], None, "uses Anthropic's official installer")
         if s == "installing":
-            tail = [l for l in self.out.replace("\r", "\n").splitlines() if l.strip()][-4:]
-            return ("Installing Claude Code" + dots, tail or ["starting" + dots], None, "this can take a few minutes")
+            secs = int(time.time() - self.inst.t0) if self.inst else 0
+            body = self.inst.lines(dots) if self.inst else ["starting" + dots]
+            return ("Installing Claude Code", body, None, "%d:%02d  this can take a few minutes" % (secs // 60, secs % 60))
         if s == "choose":
             return ("Sign in to Claude",
                     ["How do you pay for Claude?", "",
@@ -565,31 +770,34 @@ curl -fsSL https://claude.ai/install.sh | bash</pre>
             else:
                 how = ["scan with your phone, sign in", "there and paste the code back.",
                        "phone must be on the same wifi" if kind == "wifi" else "phone must be on tailscale"]
-            lines = how + ["", "or type the code + enter:", "> " + self.app.input[-24:] + "_"]
+            lines = how + ["", "or type the code + enter:", ("> " + self.app.input[-26:] + "_", "accent")]
             if self.msg:
-                lines.append(self.msg)
+                lines.append((self.msg, "dim"))
             if not self.login_url:
                 lines, qr = ["starting sign-in" + dots], None
             names = [m[0] for m in self.qr_modes(True)]
             return ("Sign in (%s)" % kind, lines, qr,
                     mode_footer("tab: switch QR (", names, kind, ")  esc: back"))
-        if s == "done":
-            return ("You're in ✓", ["signed in: %s" % getattr(self, "who", ""), "",
-                                    "enter  start chatting", "",
-                                    "F1 settings  F2 chats  ctrl+q quit"], None, "")
         if s == "error":
             return ("Hmm", [self.msg or "something went wrong", "", "enter  try again", "q  quit"], None, "")
         if s == "remote":
             c = remote_cfg()
-            kind, qr = self.current_qr("remote", with_link=False)
-            lines = ["run Claude on your PC, this is", "just the screen. scan to set up",
-                     "(phone or PC browser on the",
-                     "same wifi)" if kind == "wifi" else "on tailscale)", "",
-                     "PC: " + ("%s@%s" % (c["user"], c["host"]) if c else "not set"),
-                     self.remote_msg[:34]]
-            foot = "t test  d remove  esc back"
-            names = [m[0] for m in self.qr_modes(False)]
-            if len(names) > 1:
-                foot = mode_footer("tab ", names, kind, "  " + foot)
-            return ("Remote PC (%s)" % kind, lines, qr, foot)
+            views = self.remote_views()
+            name, kind, host = views[self.rview % len(views)]
+            pc = ("PC: %s@%s" % (c["user"], c["host"])) if c else "PC: not set up yet"
+            status = (self.remote_msg[:44], "ok" if self.remote_ok else "dim") if self.remote_msg else ("", "dim")
+            foot = mode_footer("tab ", [v[0] for v in views], name, "  t test d del esc")
+            if kind == "qr":
+                url = self.helper.url("remote", host) if self.helper else None
+                return ("Remote PC", ["scan with your phone or PC", "for the setup page (needs the",
+                                      "same wifi)" if host == lan_ip() else "tailscale)", "", pc, status],
+                        url, foot)
+            base = "http://%s:%d/%s" % (host, self.helper.port if self.helper else HELPER_PORT,
+                                        self.helper.token if self.helper else "?")
+            return ("Remote PC", ["On the PC, in an ADMIN PowerShell:",
+                                  ("irm %s/win|iex" % base, "cmd"),
+                                  "Mac/Linux terminal:",
+                                  ("curl -s %s/unix|bash" % base, "cmd"),
+                                  ("sets up SSH + tells me the PC's address", "dim"),
+                                  pc, status], None, foot)
         return ("", [], None, "")

@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 VERSION=$(cat VERSION)
 PKG=build/pkg
-rm -rf build; mkdir -p "$PKG/DEBIAN" dist
+rm -rf build; mkdir -p "$PKG/DEBIAN" dist; chmod 755 "$PKG"
 
 A="$PKG/usr/share/APPLaunch"
 S="$PKG/usr/share/clawputer"
@@ -23,7 +23,7 @@ Type=Application
 EOF
 chmod 644 "$A/applications/clawputer.desktop"
 
-install -m 644 src/clawputer_gui.py src/clawputer_setup.py src/CLAUDE.md src/CLAUDE.remote.md src/tmux.conf "$S/"
+install -m 644 src/clawputer_gui.py src/clawputer_setup.py src/CLAUDE.md src/CLAUDE.remote.md src/tmux.conf VERSION "$S/"
 install -m 755 src/boost/clawputer-boost src/boost/clawputer-bootmode src/boost/enable-boost.sh src/boost/disable-boost.sh "$S/boost/"
 install -m 644 LICENSE "$PKG/usr/share/doc/clawputer/copyright"
 

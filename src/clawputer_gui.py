@@ -57,6 +57,7 @@ SETTINGS = [
     ("dblspace", "double space = '. '", ["on", "off"], False),
     ("enter", "enter key", ["send", "new line"], False),
     ("@remote", "remote pc setup", None, False),
+    ("@about", "about / version", None, False),
     ("@signout", "sign out of claude", None, False),
 ]
 DEFAULTS = {"model": "default", "effort": "default", "permissions": "ask", "font": "10", "tool_lines": "3", "start": "last chat",
@@ -159,7 +160,7 @@ class Framebuffer:
 class Keyboard:
     SPECIAL = {1: "esc", 14: "backspace", 15: "tab", 28: "enter", 103: "up", 108: "down",
                105: "left", 106: "right", 104: "pgup", 109: "pgdn", 102: "home", 107: "end",
-               111: "delete", 59: "f1", 60: "f2"}
+               111: "delete", 59: "f1", 60: "f2", 61: "f3"}
     CHARS = dict(zip(range(2, 14), "1234567890-="))
     CHARS.update(dict(zip(range(16, 28), "qwertyuiop[]")))
     CHARS.update(dict(zip(range(30, 42), "asdfghjkl;'`")))
@@ -513,13 +514,22 @@ class App:
         self.claude = None
         self.setup = None
         self.setup_return = False
+        self.modescr = None        # "where should claude run?" screen (menu mode)
+        self.overlay = None        # help / about box: (title, [lines])
+        self.pc_after_setup = False
+        self.menu_mode = "--menu" in self.extra_args
+        self.extra_args = [a for a in self.extra_args if a != "--menu"]
         self.splash("starting clawputer...")
-        if REMOTE:
+        if self.menu_mode:
+            # first: Claude Code installed + signed in? (background check with a progress
+            # screen; installs / signs in if needed), then the mode screen
+            self.setup = setup.Setup(self)
+        elif REMOTE:
             self.splash("connecting to your pc...")
             self.begin_chat()
+        elif os.environ.get("CLAWPUTER_CHECKED") == "1":
+            self.begin_chat()                # the menu already checked install + sign-in
         else:
-            # checks Claude Code is installed + signed in (in the background, with a
-            # progress screen); if all good it finishes on its own and the chat opens
             self.setup = setup.Setup(self)
 
     def splash(self, text):
@@ -761,7 +771,7 @@ class App:
                 self.hist = None
                 if chat["id"] != self.session_id or not self.claude.alive():
                     self.open_chat(chat)
-        elif k in ("esc", "f2", "ctrl+o"):
+        elif k in ("esc", "f3", "ctrl+o"):
             self.hist = None
 
     def draw_history(self, d):
@@ -797,6 +807,12 @@ class App:
         if self.setup:
             self.setup.key(k)
             return
+        if self.modescr is not None:
+            self.mode_key(k)
+            return
+        if self.overlay:
+            self.overlay = None              # any key closes help / about
+            return
         if self.menu is not None:
             self.menu_key(k)
             return
@@ -812,10 +828,13 @@ class App:
             else:
                 self.ask_key(k)
                 return
-        if k in ("f1", "ctrl+s"):
+        if k == "f1":
+            self.show_help()
+            return
+        if k in ("f2", "ctrl+s"):
             self.open_menu()
             return
-        if k in ("f2", "ctrl+o"):
+        if k in ("f3", "ctrl+o"):
             self.open_history()
             return
         if self.pending:
@@ -983,6 +1002,9 @@ class App:
         if text in ("/settings", "/s"):
             self.open_menu()
             return
+        if text in ("/help", "/?"):
+            self.show_help()
+            return
         if text in ("/history", "/h", "/chats"):
             self.open_history()
             return
@@ -1030,7 +1052,7 @@ class App:
                 self.run_action(key)
             elif k == "enter":
                 self.submenu = choices.index(self.cfg[key]) if self.cfg[key] in choices else 0
-            elif k in ("esc", "f1", "ctrl+s"):
+            elif k in ("esc", "f2", "ctrl+s"):
                 self.close_menu()
         else:
             if up:
@@ -1045,7 +1067,201 @@ class App:
             elif k == "esc":
                 self.submenu = None
 
+    # -- help / about overlays --
+    def show_help(self):
+        self.overlay = ("keys", [
+            "enter        send message",
+            "fn+f / fn+x  scroll a line",
+            "fn+z / fn+c  scroll a page",
+            "esc          stop claude / clear box",
+            "y  n  a      answer permission prompts",
+            "F2           settings",
+            "F3           chats (n new, d delete)",
+            "ctrl+q       quit     /new  new chat",
+        ])
+
+    def show_about(self):
+        self.splash("checking versions...")
+        try:
+            ver = open(os.path.join(SHARE, "VERSION")).read().strip()
+        except OSError:
+            ver = "dev"
+        try:
+            cmd = setup.ssh_base() + ["claude --version"] if REMOTE else [CLAUDE, "--version"]
+            cv = subprocess.run(cmd, capture_output=True, timeout=20).stdout.decode(errors="replace").split()[0]
+        except (OSError, IndexError, subprocess.TimeoutExpired):
+            cv = "?"
+        if REMOTE:
+            c = setup.remote_cfg() or {}
+            who, where = "(managed on the pc)", "your pc: %s@%s" % (c.get("user"), c.get("host"))
+        else:
+            st = setup.auth_status()
+            who = st.get("email") or st.get("authMethod") or "not signed in"
+            where = "this cardputer"
+        inst, gpu = boost_state()
+        boost = ("active, +112MB" if gpu <= 16 else "on") if inst else "not set up"
+        self.overlay = ("about", [
+            "Clawputer %s (unofficial)" % ver,
+            "claude code %s" % cv,
+            "signed in: %s" % who[:30],
+            "running on: %s" % where[:28],
+            "ram free: %dMB   boost: %s" % (mem_free_mb(), boost),
+            "github.com/RubberDingyRapids/clawputer",
+        ])
+
+    def draw_overlay(self, d):
+        title, lines = self.overlay
+        bh = len(lines) * 12 + 30
+        top = max(2, (H - bh) // 2)
+        d.rectangle((8, top, W - 8, top + bh), fill=(25, 25, 35), outline=ACCENT)
+        d.text((16, top + 4), title, font=self.small, fill=ACCENT)
+        for i, ln in enumerate(lines):
+            d.text((16, top + 18 + i * 12), ln, font=self.small, fill=FG)
+        hint = "any key to close"
+        d.text(((W - self.small.getlength(hint)) // 2, top + bh - 12), hint, font=self.small, fill=DIM)
+
+    # -- mode screen: where should claude run? (menu mode) --
+    MODE_DESC = {
+        "local": "runs here. claude uses ~200MB of the ~350MB ram, so it's slower. ram boost recommended.",
+        "pc": "runs on your pc over ssh: fast, no ram limits. the pc must be on.",
+        "terminal": "the full claude code interface (pageup scrolls).",
+        "boost": "pauses background stuff while claude runs, plus an optional reboot for +112MB. asks your password once.",
+        "reboot": "one-boot trick: moves gpu memory to ram (+112MB). camera is off until the next reboot.",
+        "quit": "back to the launcher.",
+    }
+
+    def open_mode(self, first=False):
+        inst, gpu = boost_state()
+        self.modescr = {"first": first, "boost": inst, "gpu": gpu, "prompt": None, "sel": 0}
+        last = {"gui": "local", "remote": "pc"}.get(read_file(os.path.join(CONF, "ui")), None)
+        last = last or read_file(os.path.join(CONF, "ui")) or "local"
+        keys = [i[0] for i in self.mode_items()]
+        self.modescr["sel"] = keys.index(last) if last in keys else 0
+        if os.environ.pop("CLAWPUTER_AFTER", "") == "local":
+            self.mode_pick("local")
+        self.dirty = True
+
+    def mode_items(self):
+        m = self.modescr
+        rc = setup.remote_cfg()
+        items = [("local", "on this cardputer"),
+                 ("pc", "on my pc" if rc else "on my pc  (set up)"),
+                 ("terminal", "terminal (default claude code)")]
+        if not m["boost"]:
+            items.append(("boost", "set up ram boost"))
+        elif m["gpu"] > 16:
+            items.append(("reboot", "reboot for +112MB ram"))
+        items.append(("quit", "quit"))
+        return items
+
+    def mode_key(self, k):
+        m = self.modescr
+        if m["prompt"]:
+            _, _, yes, no = m["prompt"]
+            if k in ("y", "Y", "enter"):
+                self.choose(yes)
+            elif k in ("n", "N"):
+                self.choose(no)
+            elif k == "esc":
+                m["prompt"] = None
+            return
+        items = self.mode_items()
+        keys = [i[0] for i in items]
+        hot = {"g": "local", "r": "pc", "t": "terminal", "b": "boost", "q": "quit"}
+        if k in ("f", "F", "up"):
+            m["sel"] = (m["sel"] - 1) % len(items)
+        elif k in ("x", "X", "down"):
+            m["sel"] = (m["sel"] + 1) % len(items)
+        elif k == "enter":
+            self.mode_pick(keys[m["sel"]])
+        elif k in hot and hot[k] in keys:
+            m["sel"] = keys.index(hot[k])
+            self.mode_pick(hot[k])
+        elif k in ("esc", "ctrl+q"):
+            self.choose("quit")
+
+    def mode_pick(self, key):
+        m = self.modescr
+        if key == "local" and not m["boost"]:
+            m["prompt"] = ("RAM boost recommended", [
+                "claude uses ~200MB; the cardputer has",
+                "~350MB. ram boost pauses background",
+                "stuff while claude runs, and can",
+                "reboot with +112MB. it asks your",
+                "password once."], "boost-setup-local", "local")
+            m["prompt_keys"] = "y set it up    n not now    esc back"
+        elif key == "local" and m["gpu"] > 16:
+            m["prompt"] = ("More RAM?", [
+                "reboot now with gpu memory moved",
+                "to ram (+112MB)? the camera is off",
+                "until the next reboot.",
+                "",
+                "after it restarts, open Clawputer."], "reboot", "local")
+            m["prompt_keys"] = "y reboot    n just go    esc back"
+        elif key == "pc" and not setup.remote_cfg():
+            self.pc_after_setup = True
+            self.setup = setup.Setup(self, remote_only=True)
+        else:
+            self.choose(key)
+
+    def choose(self, choice):
+        try:
+            os.makedirs(CONF, exist_ok=True)
+            with open(os.path.join(CONF, "choice"), "w") as f:
+                f.write(choice)
+            if choice in ("local", "pc", "terminal"):
+                with open(os.path.join(CONF, "ui"), "w") as f:
+                    f.write(choice)
+        except OSError as e:
+            log("choice", e)
+        raise SystemExit
+
+    def draw_mode(self, img, d):
+        m = self.modescr
+        title = "You're in ✓  where should claude run?" if m["first"] else "Clawputer · where should claude run?"
+        d.text((6, 3), title, font=self.small, fill=ACCENT)
+        right = battery_clock()
+        d.text((W - 4 - self.small.getlength(right), 3), right, font=self.small, fill=DIM)
+        d.line((0, 15, W, 15), fill=BAR)
+        items = self.mode_items()
+        y = 19
+        for i, (key, label) in enumerate(items):
+            on = i == m["sel"]
+            if on:
+                d.rectangle((4, y - 1, W - 4, y + 11), fill=(55, 45, 50))
+            d.text((10, y), ("> " if on else "  ") + label, font=self.small, fill=FG if on else DIM)
+            y += 13
+        desc = self.MODE_DESC.get(items[m["sel"]][0], "")
+        if items[m["sel"]][0] == "pc" and setup.remote_cfg():
+            c = setup.remote_cfg()
+            desc += " pc: %s@%s" % (c["user"], c["host"])
+        y += 3
+        for ln in textwrap.wrap(desc, 56)[:3]:
+            d.text((8, y), ln, font=self.small, fill=DIM)
+            y += 11
+        if m["boost"] and m["gpu"] <= 16:
+            st, col = "boost active · +112MB · ram free %dMB" % mem_free_mb(), (120, 210, 130)
+        else:
+            st, col = "ram free %dMB · boost %s" % (mem_free_mb(), "on" if m["boost"] else "off"), DIM
+        d.text((6, H - 24), st, font=self.small, fill=col)
+        d.text((6, H - 12), "f/x move  enter pick  g r t b hotkeys  q quit", font=self.small, fill=DIM)
+        if m["prompt"]:
+            ptitle, plines, _, _ = m["prompt"]
+            bh = len(plines) * 12 + 34
+            top = max(2, (H - bh) // 2)
+            d.rectangle((10, top, W - 10, top + bh), fill=(25, 25, 35), outline=ACCENT)
+            d.text((18, top + 4), ptitle, font=self.small, fill=ACCENT)
+            for i, ln in enumerate(plines):
+                d.text((18, top + 18 + i * 12), ln, font=self.small, fill=FG)
+            hint = m.get("prompt_keys", "y yes   n no   esc back")
+            d.text(((W - self.small.getlength(hint)) // 2, top + bh - 13), hint, font=self.small, fill=ACCENT)
+        self.fb.write(img)
+        self.dirty = False
+
     def run_action(self, key):
+        if key == "@about":
+            self.show_about()
+            return
         if key == "@remote":
             self.setup = setup.Setup(self, remote_only=True)
             self.setup_return = True
@@ -1212,10 +1428,21 @@ class App:
         q = setup.qr_image(qr, 118) if qr else None
         textw = W - 12 - (q.size[0] + 8 if q else 0)
         maxc = max(10, int(textw // max(1, self.small.getlength("M"))))
+        styles = {"ok": (120, 210, 130), "accent": ACCENT, "dim": DIM, "cmd": TOOL}
         y = 22
         for ln in lines:
-            for part in (textwrap.wrap(ln, maxc) or [""]):
-                d.text((6, y), part, font=self.small, fill=FG)
+            if isinstance(ln, tuple) and ln[0] == "__bar__":      # progress bar
+                _, frac, label = ln
+                bw = int(textw * 0.62)
+                d.rectangle((10, y + 2, 10 + bw, y + 9), outline=BOX)
+                d.rectangle((11, y + 3, 11 + int((bw - 2) * frac), y + 8), fill=ACCENT)
+                d.text((16 + bw, y), "%3d%% %s" % (frac * 100, label), font=self.small, fill=FG)
+                y += 13
+                continue
+            text, style = (ln if isinstance(ln, tuple) else (ln, None))
+            parts = [text] if style == "cmd" else (textwrap.wrap(text, maxc) or [""])
+            for part in parts:
+                d.text((6, y), part, font=self.small, fill=styles.get(style, FG))
                 y += 12
         if q:
             img.paste(q, (W - q.size[0] - 6, 22))
@@ -1234,6 +1461,8 @@ class App:
         d = ImageDraw.Draw(img)
         if self.setup:
             return self.draw_setup(img, d)
+        if self.modescr is not None:
+            return self.draw_mode(img, d)
         # top bar
         spin = "|/-\\"[int(time.time() * 4) % 4] if self.busy else ""
         left = ("claude " + spin + " " + self.status) if self.busy else ("claude · " + self.status)
@@ -1308,9 +1537,9 @@ class App:
                 hint = "type your answer, enter = send, esc = back"
                 d.text((W - 8 - self.small.getlength(hint), top + 2), hint, font=self.small, fill=ASK)
             elif not self.input and not self.busy:
-                hint = "F1 settings  F2 chats  ctrl+q quit"
+                hint = "F1 help  F2 settings  F3 chats"
                 if self.cfg["enter"] == "new line":
-                    hint = "ctrl+enter send  F1 settings  F2 chats"
+                    hint = "ctrl+enter send  F1 help  F2 set"
                 d.text((W - 8 - self.small.getlength(hint), top + 2), hint, font=self.small, fill=DIM)
         if self.ask and not self.ask["typing"] and self.menu is None and self.hist is None:
             self.draw_ask(d)
@@ -1318,6 +1547,8 @@ class App:
             self.draw_menu(d)
         elif self.hist is not None:
             self.draw_history(d)
+        elif self.overlay:
+            self.draw_overlay(d)
         self.fb.write(img)
         self.dirty = False
 
@@ -1335,13 +1566,29 @@ class App:
                     self.dirty = True
                 if self.setup and self.setup.finished:
                     back = getattr(self, "setup_return", False)
+                    first = self.setup.did_login
+                    remote_ok = self.setup.remote_ok
                     self.setup.close()
                     self.setup = None
                     self.input = ""
-                    if not back or self.claude is None:
+                    if self.menu_mode:
+                        if self.pc_after_setup:          # came from "on my pc (set up)"
+                            self.pc_after_setup = False
+                            if remote_ok and setup.remote_cfg():
+                                self.choose("pc")
+                        if self.modescr is None:
+                            self.open_mode(first=first)
+                    elif not back or self.claude is None:
                         self.splash("opening chat...")
                         self.begin_chat()
                     self.dirty = True
+                self.draw()
+                continue
+            if self.modescr is not None:
+                r, _, _ = select.select([self.kb.fd], [], [], 1.0)
+                if self.kb.fd in r:
+                    for k in self.kb.read():
+                        self.key(k)
                 self.draw()
                 continue
             fds = [self.kb.fd]
@@ -1384,6 +1631,52 @@ class App:
                 self.kb.close()
             finally:
                 self.fb.close()
+
+
+BOOST = "/usr/local/sbin/clawputer-boost"
+
+
+def read_file(path):
+    try:
+        return open(path).read().strip()
+    except OSError:
+        return ""
+
+
+def gpu_mb():
+    try:
+        out = subprocess.run(["vcgencmd", "get_mem", "gpu"], capture_output=True, timeout=5).stdout.decode()
+        return int(re.sub(r"\D", "", out) or 128)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 128
+
+
+def boost_state():
+    """-> (ram boost set up for this user?, gpu memory MB)"""
+    inst = False
+    if os.path.exists(BOOST):
+        try:
+            inst = subprocess.run(["sudo", "-n", "-l", BOOST, "on"], capture_output=True, timeout=5).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return inst, gpu_mb()
+
+
+def mem_free_mb():
+    for line in read_file("/proc/meminfo").splitlines():
+        if line.startswith("MemAvailable"):
+            return int(line.split()[1]) // 1024
+    return 0
+
+
+def battery_clock():
+    try:
+        ps = glob.glob("/sys/class/power_supply/*/capacity")[0].rsplit("/", 1)[0]
+        cap = read_file(ps + "/capacity")
+        chg = read_file(ps + "/status") == "Charging"
+        return "%s%s%% %s" % ("+" if chg else "", cap, time.strftime("%H:%M"))
+    except IndexError:
+        return time.strftime("%H:%M")
 
 
 def install_claude_md():

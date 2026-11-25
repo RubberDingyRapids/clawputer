@@ -1,9 +1,8 @@
 #!/bin/bash
-# Clawputer launcher (CardputerZero): pick where Claude runs, optional RAM boost, then go.
-#   g  chat GUI, Claude runs on this Cardputer
-#   r  chat GUI, Claude runs on your PC over SSH
-#   t  terminal, plain Claude Code (tmux, PageUp scrolls)
-#   b  set up the optional RAM boost (asks for your password once)
+# Clawputer launcher (CardputerZero).
+# Shows the GUI mode screen (first run: install Claude Code + sign in), then runs Claude where
+# you picked: on this Cardputer (chat GUI), on your PC over SSH (chat GUI), or the terminal.
+# The only terminal bits are the RAM-boost password prompt and its reboot.
 SHARE=/usr/share/clawputer
 CONF="$HOME/.config/clawputer"; mkdir -p "$CONF"
 GUI="$SHARE/clawputer_gui.py"
@@ -30,7 +29,7 @@ resume_launcher(){ [ -n "$LPID" ] && kill -CONT "$LPID" 2>/dev/null; LPID=; }
 
 # full-screen gui with the launcher paused (its status bar would draw over it)
 run_gui(){
-  sleep 0.5; printf '\033[?25l'; clear
+  sleep 0.3; printf '\033[?25l'; clear
   PYTHONPATH="$SHARE" python3 "$GUI" "$@" < /dev/null 2>>"$CONF/gui.log" &
   local gp=$!
   LPID=$(pgrep -o -f M5CardputerZero-APPLaunch)
@@ -45,7 +44,7 @@ run_gui(){
   printf '\033[?25h'; flush_keys
 }
 
-# ---------------- inside tmux (terminal mode) / after boost: run with lite mode ----------------
+# ---------------- stage 2: run Claude (inside tmux for terminal mode) ----------------
 if [ "${CLAWPUTER_STAGE:-}" = run ]; then
   GUARD=; HUPPED=
   restore(){
@@ -63,12 +62,10 @@ if [ "${CLAWPUTER_STAGE:-}" = run ]; then
         [ "$(gpu_mb)" -le 16 ] 2>/dev/null && echo "low gpu memory + camera off until a reboot."; } > "$WARN"
       exit 0
     fi
-    if [ "$(gpu_mb)" -le 16 ] 2>/dev/null; then
+    if [ "$(gpu_mb)" -le 16 ] 2>/dev/null && boost_ok; then
       echo; echo "reboot back to normal?"; echo "(gives gpu memory back"; echo " + turns camera on) y/n"
       if read -rsn1 -t 30 k && { [ "$k" = y ] || [ "$k" = Y ]; }; then
         echo "rebooting..."; sudo -n "$BOOTMODE" exit; sleep 60
-      else
-        echo "staying in boost mode (low gpu memory + camera off till reboot)"; sleep 2
       fi
     fi
     exit 0
@@ -89,8 +86,7 @@ if [ "${CLAWPUTER_STAGE:-}" = run ]; then
       printf 'clawputer was force-closed.\neverything was put back.\n' > '$WARN'" >/dev/null 2>&1 < /dev/null &
     GUARD=$!
   fi
-  free -m | awk '/Mem:/{print "ram free: "$7" MB"}'
-  export DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+  export DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAWPUTER_CHECKED=1
   mkdir -p "$HOME/clawputer"; cd "$HOME/clawputer" || exit 1
   if [ "${CLAWPUTER_UI:-}" = gui ]; then
     run_gui "$@"
@@ -100,75 +96,46 @@ if [ "${CLAWPUTER_STAGE:-}" = run ]; then
   exit 0
 fi
 
-# ---------------- menu ----------------
+# ---------------- stage 1: mode screen ----------------
 clear; echo "starting clawputer..."
 show_warning
-UIF="$CONF/ui"
-UI=$(cat "$UIF" 2>/dev/null || echo gui)
-
-# first run (no Claude Code / not signed in): the gui walks you through setup
-if [ ! -x "$CLAUDE" ] || ! "$CLAUDE" auth status 2>/dev/null | grep -q '"loggedIn": *true'; then
-  run_gui; exit 0
-fi
-
+AFTER=
 while true; do
-  clear
-  echo "== Clawputer =="
-  echo "g gui, runs on this cardputer"
-  if [ -f "$CONF/remote.json" ]; then echo "r gui, runs on your pc (fast)"
-  else echo "r gui on your pc (set up: F1 in gui)"; fi
-  echo "t terminal (default claude code)"
-  if boost_ok; then echo "  ram boost: on"; else echo "b set up ram boost (optional)"; fi
-  echo "enter = $UI   q = quit"
-  read -rsn1 k
-  case "$k" in
-    g|G) UI=gui;; r|R) UI=remote;; t|T) UI=terminal;; ""|$'\n') ;;
-    b|B)
+  rm -f "$CONF/choice"
+  CLAWPUTER_AFTER="$AFTER" run_gui --menu
+  AFTER=
+  CHOICE=$(cat "$CONF/choice" 2>/dev/null || echo quit)
+  case "$CHOICE" in
+    boost-setup|boost-setup-local)
       clear
-      echo "RAM boost: while Claude runs on the"
-      echo "cardputer, pause the desktop, audio,"
-      echo "printing etc, and optionally reboot"
-      echo "with more RAM (camera off that boot)."
-      echo "needs your password once."
+      echo "== RAM boost setup =="
+      echo "installs 2 small helpers so clawputer"
+      echo "can pause background services while"
+      echo "claude runs (undo any time). enter"
+      echo "your password:"
       echo
-      sudo "$SHARE/boost/enable-boost.sh" && echo "done." || echo "not enabled."
-      read -rsn1 -t 10 -p "any key..." _; continue;;
-    q|Q) clear; exit 0;;
-    *) continue;;
+      if sudo "$SHARE/boost/enable-boost.sh"; then
+        echo "done."; [ "$CHOICE" = boost-setup-local ] && AFTER=local
+      else
+        echo "not enabled."
+      fi
+      sleep 1; continue;;
+    reboot)
+      clear; echo "rebooting with more ram..."; echo "open Clawputer again after it restarts."
+      sleep 2; sudo -n "$BOOTMODE" enter; sleep 60; exit 0;;
+    local|pc|terminal) break;;
+    *) clear; exit 0;;
   esac
-  break
 done
-echo "$UI" > "$UIF"
 
-if [ "$UI" = remote ]; then
-  if [ ! -f "$CONF/remote.json" ]; then
-    clear; echo "no PC set up yet."; echo "open the gui (g), F1 > remote pc setup."
-    read -rsn1 -t 20 -p "any key..." _; exit 0
-  fi
-  export CLAWPUTER_REMOTE=1 CLAUDE_REMOTE=1
+if [ "$CHOICE" = pc ]; then
+  export CLAWPUTER_REMOTE=1 CLAUDE_REMOTE=1 CLAWPUTER_CHECKED=1
   run_gui; exit 0
 fi
 
-# local: optional boost (pause stuff + one-boot gpu trick)
-if boost_ok; then
-  export CLAWPUTER_BOOST=1
-  if [ "$(gpu_mb)" -gt 16 ] 2>/dev/null; then
-    clear
-    echo "== RAM boost =="
-    echo "reboot to move gpu memory to ram?"
-    echo "(+~112MB, camera off till next reboot)"
-    echo
-    echo "y reboot now (open Clawputer after)"
-    echo "n just go"
-    read -rsn1 k
-    if [ "$k" = y ] || [ "$k" = Y ]; then
-      echo; echo "rebooting..."; sleep 1; sudo -n "$BOOTMODE" enter; sleep 60; exit 0
-    fi
-  fi
-fi
-
+boost_ok && export CLAWPUTER_BOOST=1
 export CLAWPUTER_STAGE=run
-if [ "$UI" = terminal ]; then
+if [ "$CHOICE" = terminal ]; then
   export CLAWPUTER_UI=terminal
   exec tmux -L "$TMUX_SOCK" -f "$SHARE/tmux.conf" new-session -A -s clawputer "$0" "$@"
 fi
