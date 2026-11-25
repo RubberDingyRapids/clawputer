@@ -10,7 +10,7 @@ and built-in keyboard.
 | | | |
 |---|---|---|
 | ![chat](store/screenshots/1-chat.png) | ![permission](store/screenshots/2-permission.png) | ![question](store/screenshots/3-question.png) |
-| ![settings](store/screenshots/4-settings.png) | ![history](store/screenshots/5-history.png) | ![sign in](store/screenshots/6-signin.png) |
+| ![start](store/screenshots/4-start.png) | ![history](store/screenshots/5-history.png) | ![sign in](store/screenshots/6-signin.png) |
 
 ## Features
 

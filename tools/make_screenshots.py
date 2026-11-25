@@ -1,6 +1,7 @@
 """Render store screenshots (320x170 PNG) on the device using the real app code + fonts,
 with example content and no real Claude session. Usage: python3 make_screenshots.py OUTDIR"""
 import os, sys, time
+os.environ["CLAWPUTER_CHECKED"] = "1"
 sys.path.insert(0, "/usr/share/clawputer")
 import clawputer_gui as g
 import clawputer_setup as su
@@ -86,12 +87,13 @@ a.start_ask("q", {"questions": [{"question": "What kind of project should I set 
                   "multiSelect": False}]})
 save(a, "3-question.png")
 
-# 4. settings
+# 4. start screen + RAM menu
 a = app()
-a.add("user", "hi!")
-a.add("assistant", "Hey! What are we building today?")
-a.open_menu()
-save(a, "4-settings.png")
+a.claude = None
+a.open_mode(first=False)
+a.modescr["boost"] = True; a.modescr["gpu"] = 128
+a.modescr["ram"] = 0
+save(a, "4-start.png")
 
 # 5. chat history
 a = app()
