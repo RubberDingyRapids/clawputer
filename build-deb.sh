@@ -43,17 +43,6 @@ Description: Pocket chat app for Claude Code on CardputerZero (unofficial)
  runs Claude on your PC. Not affiliated with Anthropic.
 EOF
 
-# on uninstall, undo the optional RAM boost if the user had enabled it
-cat > "$PKG/DEBIAN/prerm" <<'EOF'
-#!/bin/sh
-set -e
-if [ "$1" = remove ] || [ "$1" = purge ]; then
-  [ -x /usr/share/clawputer/boost/disable-boost.sh ] && [ -e /etc/sudoers.d/clawputer ] && \
-    /usr/share/clawputer/boost/disable-boost.sh || true
-fi
-exit 0
-EOF
-chmod 755 "$PKG/DEBIAN/prerm"
 
 # python byte-code would be root-owned clutter; keep the package source-only
 find "$PKG" -name '__pycache__' -prune -exec rm -rf {} +

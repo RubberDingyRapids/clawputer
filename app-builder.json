@@ -1,13 +1,16 @@
 {
   "package_name": "clawputer",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "app_name": "Clawputer",
   "bin_name": "clawputer",
   "description": "Pocket chat app for Claude Code on CardputerZero (unofficial)",
   "store": {
     "summary": "Claude Code in your pocket: a chat app made for the Cardputer (unofficial)",
     "description": "Clawputer is a pocket chat app for Anthropic's Claude Code, built for the CardputerZero's 320x170 screen and keyboard.\n\n- Clean chat view: tool calls squashed to one line, command output and code in tidy boxes\n- Permission prompts (y / n / always) and Claude's multiple-choice questions\n- Help (F1), settings (F2): model, effort, permissions, font size and more; chat history (F3)\n- Drafts autosave, messages queue while Claude is busy\n- Easy first-run setup: installs Claude Code with Anthropic's official installer, then sign in by scanning a QR code with your phone, no typing long codes\n- Remote mode: run Claude on your PC over SSH (works with Tailscale) and use the Cardputer as the screen, fast and with no RAM limits. Set up with one short command on the PC\n- Optional RAM boost: pauses background services while Claude runs on the Cardputer\n- Terminal mode for the full Claude Code interface\n\nNeeds a Claude subscription (Pro/Max) or an Anthropic Console account. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic.",
-    "categories": ["AI", "Development"],
+    "categories": [
+      "AI",
+      "Development"
+    ],
     "screenshots": [
       "store/screenshots/1-chat.png",
       "store/screenshots/2-permission.png",
@@ -19,7 +22,10 @@
     "icon": "store/icon.png",
     "license": "MIT",
     "source_repo": "https://github.com/RubberDingyRapids/clawputer",
-    "author": { "github": "RubberDingyRapids", "display_name": "RubberDingyRapids" },
+    "author": {
+      "github": "RubberDingyRapids",
+      "display_name": "RubberDingyRapids"
+    },
     "share_code": "CLAW",
     "permissions": {
       "camera": false,
@@ -30,6 +36,19 @@
       "background_service": false,
       "external_display": false
     },
-    "locales": {}
+    "locales": {
+      "en": {
+        "title": "Clawputer",
+        "summary": "Claude Code in your pocket: a chat app made for the Cardputer (unofficial)"
+      },
+      "zh-CN": {
+        "title": "Clawputer",
+        "summary": "口袋里的 Claude Code：专为 Cardputer 打造的聊天应用（非官方）"
+      },
+      "ja": {
+        "title": "Clawputer",
+        "summary": "ポケットの中の Claude Code：Cardputer 向けチャットアプリ（非公式）"
+      }
+    }
   }
 }

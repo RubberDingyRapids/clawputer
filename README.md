@@ -51,7 +51,8 @@ tight. Two ways to make it better:
   background services (desktop, printing, etc., list in `/etc/clawputer/boost.conf`) while
   Claude runs, and offer a one-boot reboot that moves GPU memory to RAM (+~112MB, camera off
   for that boot; the next reboot is back to normal automatically). Undo with
-  `sudo /usr/share/clawputer/boost/disable-boost.sh`.
+  `sudo clawputer-boost-uninstall` (works even after uninstalling the app; do this before
+  removing Clawputer if you want everything gone).
 - **Remote mode**: pick *on my pc* on the start screen. It shows **one short command** to type
   into an admin PowerShell (or a Mac/Linux terminal) on the PC: it fetches a setup script from
   the Cardputer that enables SSH with the Cardputer's key and reports the PC's address back,
