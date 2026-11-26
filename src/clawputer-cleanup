@@ -4,7 +4,6 @@
 CONF="$HOME/.config/clawputer"
 rm -f "$CONF/gui.state"
 if [ -e "$CONF/boost.on" ]; then
-  systemctl --user --no-block start pipewire.socket pipewire-pulse.socket wireplumber 2>/dev/null
   sudo -n /usr/local/sbin/clawputer-boost off >/dev/null 2>&1
   rm -f "$CONF/boost.on"
 fi

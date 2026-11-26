@@ -2191,13 +2191,13 @@ class App:
         try:
             if on:
                 open(BOOST_FLAG, "w").close()            # the cleanup hook undoes it if we crash
+                # (audio / pipewire stays up: the launcher keeps a pulse connection, and restarting
+                # pipewire under it hung the launcher when it took the screen back)
                 run("systemctl", "--user", "stop", "xdg-desktop-portal", "xdg-desktop-portal-gtk",
                     "xdg-desktop-portal-wlr", "xdg-document-portal", "xdg-permission-store", "mpris-proxy",
-                    "filter-chain", "gvfs-*", "wireplumber", "pipewire-pulse", "pipewire",
-                    "pipewire.socket", "pipewire-pulse.socket")
+                    "filter-chain", "gvfs-*")
                 run("sudo", "-n", BOOST, "on")
             else:
-                run("systemctl", "--user", "start", "pipewire.socket", "pipewire-pulse.socket", "wireplumber")
                 run("sudo", "-n", BOOST, "off")
                 try:
                     os.unlink(BOOST_FLAG)

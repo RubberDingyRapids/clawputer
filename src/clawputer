@@ -19,7 +19,7 @@ echo $$ > "$CONF/gui.ctl"  # the chat on screen checks we're still here
 boost_ok(){ [ -x "$BOOST" ] && sudo -n -l "$BOOST" on >/dev/null 2>&1; }
 chat_running(){ systemctl --user is-active --quiet "$UNIT"; }
 chat_pid(){ systemctl --user show -p MainPID --value "$UNIT" 2>/dev/null; }
-gui_state(){ local st=; read -r st < "$STATE" 2>/dev/null; echo "$st"; }
+gui_state(){ local st=; { read -r st < "$STATE"; } 2>/dev/null; echo "$st"; }
 
 # stay here (so the launcher keeps out of the way) while the chat is on screen
 wait_chat(){
