@@ -29,7 +29,10 @@ built-in keyboard and reads a **320x170 screen** through the Clawputer chat app.
   (`/sys/class/leds/ext_5v_out/brightness`, 255 = on); `i2cdetect -y 1` lists I2C devices
   (0x43 = the LoRa cap's IO expander). Ask the user if unsure. Caps are **not hot-swappable**:
   tell the user to power off before changing them. Only one app may use a radio at a time.
-- `sudo` needs the user's password. Don't try sudo commands; tell the user what to run.
+- For root, use `sudo -A <command>`: Clawputer pops up a password box showing the command and the
+  user types the password there (it never reaches you). Say what it's for first. Plain `sudo`
+  fails (no terminal). Never run the askpass helper yourself or try to capture the password.
+  Don't add `-k`: the popup lets the user choose whether sudo remembers it for the chat.
 - Launcher apps are `.desktop` files in `/usr/share/APPLaunch/applications/` (root-owned).
 
 ## Working style

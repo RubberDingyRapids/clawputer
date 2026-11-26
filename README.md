@@ -41,6 +41,15 @@ and built-in keyboard.
 | F3 / Ctrl+O | chats (`n` new, `d` delete) |
 | Ctrl+Q or `/exit` | quit (`/new` starts a fresh chat) |
 
+### Web UI (phone / PC)
+
+F2 > **web ui: start / stop** serves the chat to any browser on your network (set **web ui on
+open** to start it every time). The Cardputer shows the address, a key and a QR code: scan it,
+or open the address and type the key. You get the live chat, a message box, tap-to-answer
+permission prompts, questions and sudo popups, your chats, settings, and a mirror of the
+Cardputer's screen with its keys. It's plain HTTP protected by the key: fine at home or over
+Tailscale, but avoid typing a sudo password through it on shared Wi-Fi.
+
 ## Running on the Cardputer vs on a PC
 
 Claude Code wants ~200MB of RAM; the CardputerZero has ~350MB usable. It works, but it's

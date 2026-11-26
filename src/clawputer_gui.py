@@ -14,7 +14,7 @@ Keys
   type + Enter ........ send message
   Up / Down ........... scroll one line
   Left / Right ........ scroll one page
-  Esc ................. stop Claude's current turn (or clear the input)
+  Esc ................. stop Claude's current turn (or clear the input); on an
   Ctrl+Q or /exit ..... quit            /new ... fresh conversation
 """
 import fcntl
@@ -24,6 +24,8 @@ import mmap
 import os
 import re
 import select
+import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -44,6 +46,10 @@ CONF = setup.CONFIG_DIR
 LOGFILE = os.path.join(CONF, "gui.log")
 SETTINGS_FILE = os.path.join(CONF, "gui.json")
 DRAFTS_FILE = os.path.join(CONF, "drafts.json")
+STATE_FILE = os.path.join(CONF, "gui.state")   # "shown" / "hidden", read by the launcher script
+CTL_FILE = os.path.join(CONF, "gui.ctl")       # pid of the launcher script showing us right now
+CAN_HIDE = False   # hiding in the background was removed in 0.2.3 (RAM pressure froze the device)
+ASKPASS_SOCK = os.path.join(CONF, "askpass.sock")   # sudo -A password popups (see clawputer-askpass)
 SHARE = os.path.dirname(os.path.abspath(__file__))
 
 # (key, label, choices, restarts claude?)
@@ -56,12 +62,14 @@ SETTINGS = [
     ("start", "on start", ["last chat", "new chat"], False),
     ("dblspace", "double space = '. '", ["on", "off"], False),
     ("enter", "enter key", ["send", "new line"], False),
+    ("web", "web ui on open", ["off", "on"], False),
+    ("@web", "web ui: start / stop", None, False),
     ("@remote", "remote pc setup", None, False),
     ("@about", "about / version", None, False),
     ("@signout", "sign out of claude", None, False),
 ]
 DEFAULTS = {"model": "default", "effort": "default", "permissions": "ask", "font": "10", "tool_lines": "3", "start": "last chat",
-            "dblspace": "on", "enter": "send"}
+            "dblspace": "on", "enter": "send", "web": "off"}
 
 
 def load_settings():
@@ -369,10 +377,13 @@ def ago(t):
 class ClaudeSession:
     def __init__(self, extra_args, resume=None, cwd=None):
         args = [CLAUDE, "-p", "--input-format", "stream-json", "--output-format", "stream-json",
-                "--verbose", "--permission-prompt-tool", "stdio"] + list(extra_args)
+                "--verbose", "--permission-prompt-tool", "stdio", "--include-partial-messages"] + list(extra_args)
         if resume:
             args += ["--resume", resume]
         env = dict(os.environ, DISABLE_AUTOUPDATER="1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
+        if not REMOTE:
+            # `sudo -A cmd` -> password popup in the GUI (the password never goes through claude)
+            env.update(SUDO_ASKPASS=os.path.join(SHARE, "clawputer-askpass"), CLAWPUTER_ASKPASS_SOCK=ASKPASS_SOCK)
         os.makedirs(WORKDIR, exist_ok=True)
         if REMOTE:
             # same headless claude, but on the PC; args have no spaces so the remote shell is happy
@@ -517,9 +528,25 @@ class App:
         self.modescr = None        # "where should claude run?" screen (menu mode)
         self.overlay = None        # help / about box: (title, [lines])
         self.pc_after_setup = False
+        self.hidden = False
+        self.want_show = False
+        self.sudo_sock = None      # listening socket for sudo password popups
+        self.sudo_req = None       # popup on screen: {"conn", "cmd", "pw", "retry"}
+        self.sudo_last = (0, 0)    # (sudo pid, time) of the last answer, to spot a wrong password
+        self.sudo_remember = False # "remember for this chat" (tab in the popup)
+        self.sudo_forget = None    # sudo pid: when it ends, run `sudo -k` (password not remembered)
+        self.sudo_used = False     # typed a sudo password this chat -> `sudo -k` on close
+        self.web = None            # clawputer_web.WebUI while the web ui runs
+        self.web_splash = None     # [(interface, url)] while the "open this on your phone" screen shows
+        self.web_sig = None        # what the browsers last got (only publish changes)
+        self.web_chats = None      # chat list a browser asked for
+        self.entries_gen = 0       # bumped whenever the chat is cleared / switched
+        self.turn = None           # live progress while claude works: phase, tokens (see on_stream)
         self.menu_mode = "--menu" in self.extra_args
         self.extra_args = [a for a in self.extra_args if a != "--menu"]
         self.splash("starting clawputer...")
+        if not self.menu_mode and not REMOTE:
+            self.open_askpass()
         if self.menu_mode:
             # first: Claude Code installed + signed in? (background check with a progress
             # screen; installs / signs in if needed), then the mode screen
@@ -533,6 +560,8 @@ class App:
             self.setup = setup.Setup(self)
 
     def splash(self, text):
+        if getattr(self, "hidden", False):
+            return
         img = Image.new("RGB", (W, H), BG)
         d = ImageDraw.Draw(img)
         d.text((6, 3), "Clawputer", font=self.font, fill=ACCENT)
@@ -547,6 +576,8 @@ class App:
             self.open_chat(chats[0])
         else:
             self.start_claude()
+        if self.cfg.get("web") == "on" and not self.web:
+            self.start_web()
 
     def set_font(self, size):
         self.font = ImageFont.truetype(FONT_PATH, size)
@@ -577,6 +608,11 @@ class App:
     # -- claude messages --
     def handle(self, m):
         t = m.get("type")
+        if t == "stream_event":
+            self.on_stream(m.get("event") or {}, m.get("parent_tool_use_id"))
+            return
+        if t == "user" and self.turn and not m.get("parent_tool_use_id"):
+            self.turn["phase"] = "thinking"          # tool finished, claude's on it again
         if t == "system" and m.get("subtype") == "init":
             self.session_id = m.get("session_id")
             model = (m.get("model") or "").replace("claude-", "")
@@ -609,6 +645,7 @@ class App:
                              "\n  y yes · n no · a always (" + name + ")")
         elif t == "result":
             self.busy = False
+            self.turn = None
             if self.restart_after_turn:
                 self.restart_after_turn = False
                 self.add("info", "  applying settings...")
@@ -690,6 +727,7 @@ class App:
         if self.claude:
             self.save_draft()
         self.entries.clear()
+        self.entries_gen += 1
         self.lines_cache = None
         self.scroll = 0
         self.always.clear()
@@ -721,6 +759,7 @@ class App:
         if self.claude:
             self.save_draft()
         self.entries.clear()
+        self.entries_gen += 1
         self.lines_cache = None
         self.scroll = 0
         self.always.clear()
@@ -807,6 +846,12 @@ class App:
     # -- input --
     def key(self, k):
         self.dirty = True
+        if self.sudo_req:
+            self.sudo_key(k)
+            return
+        if self.web_splash:
+            self.web_splash = None           # any key closes the web ui address screen
+            return
         if self.setup:
             self.setup.key(k)
             return
@@ -842,13 +887,7 @@ class App:
             return
         if self.pending:
             if k in ("y", "Y", "a", "A", "n", "N", "esc"):
-                p = self.pending
-                allow = k in ("y", "Y", "a", "A")
-                if k in ("a", "A"):
-                    self.always.add(p["name"])
-                self.claude.answer(p["id"], allow, p["input"])
-                self.add("info", ("  ✓ allowed" if allow else "  ✗ denied"))
-                self.pending = None
+                self.answer_pending(k)
             return
         if k == "ctrl+q":
             raise SystemExit
@@ -866,8 +905,10 @@ class App:
             if self.busy:
                 self.claude.interrupt()
                 self.add("info", "  stopping...")
-            else:
+            elif self.input:
                 self.input = ""
+            elif CAN_HIDE and not self.menu_mode:
+                self.hide()
         elif k == "backspace":
             self.input = self.input[:-1]
         elif k == "ctrl+enter":
@@ -895,6 +936,64 @@ class App:
                 self.last_space = now
         elif len(k) == 1:
             self.input += k
+
+    # -- live progress ("thinking 12s · ↓ 340 tokens"), from --include-partial-messages --
+    def on_stream(self, ev, parent):
+        tu = self.turn
+        if tu is None:
+            if not self.busy:
+                return
+            tu = self.turn = {"phase": "thinking", "done": 0, "chars": 0, "msg": 0}
+        et = ev.get("type")
+        if et == "message_start":
+            tu["done"] += tu["msg"] or tu["chars"] // 4     # previous message, if it never got a total
+            tu["msg"], tu["chars"] = 0, 0
+        elif et == "content_block_delta":
+            dl = ev.get("delta") or {}
+            tu["chars"] += len(dl.get("text") or dl.get("thinking") or dl.get("partial_json") or "")
+        elif et == "message_delta":
+            out = (ev.get("usage") or {}).get("output_tokens")
+            if out:
+                tu["msg"] = out
+        if parent:                                   # a subagent: counts, but our phase stays
+            return
+        if et == "content_block_start":
+            cb = ev.get("content_block") or {}
+            kind = cb.get("type")
+            if kind in ("thinking", "redacted_thinking"):
+                tu["phase"] = "thinking"
+            elif kind == "text":
+                tu["phase"] = "writing"
+            elif kind in ("tool_use", "server_tool_use"):
+                tu["phase"] = "using " + cb.get("name", "a tool")
+        elif et == "message_stop" and tu["phase"].startswith("using "):
+            tu["phase"] = "running " + tu["phase"][6:]
+
+    def turn_tokens(self):
+        tu = self.turn
+        return tu["done"] + (tu["msg"] or tu["chars"] // 4) if tu else 0
+
+    @staticmethod
+    def fmt_tokens(n):
+        return "%.1fk" % (n / 1000) if n >= 1000 else str(n)
+
+    def busy_label(self):
+        """'thinking 12s · ↓ 340 tokens' (or the plain status if there's no turn info)"""
+        tu = self.turn
+        if not tu:
+            return self.status
+        phase = "waiting for you" if (self.pending or self.ask or self.sudo_req) else tu["phase"]
+        secs = int(time.time() - (self.t_start or time.time()))
+        return "%s %ds · ↓ %s tokens" % (phase, secs, self.fmt_tokens(self.turn_tokens()))
+
+    def answer_pending(self, k):
+        p = self.pending
+        allow = k in ("y", "Y", "a", "A")
+        if k in ("a", "A"):
+            self.always.add(p["name"])
+        self.claude.answer(p["id"], allow, p["input"])
+        self.add("info", ("  ✓ allowed" if allow else "  ✗ denied"))
+        self.pending = None
 
     # -- AskUserQuestion --
     def start_ask(self, request_id, tool_input):
@@ -1031,6 +1130,7 @@ class App:
             self.busy = True
             self.t_start = time.time()
             self.status = "thinking"
+            self.turn = {"phase": "thinking", "done": 0, "chars": 0, "msg": 0}
         else:
             self.add("err", "couldn't reach claude. press enter again to restart.")
 
@@ -1280,6 +1380,13 @@ class App:
         self.dirty = False
 
     def run_action(self, key):
+        if key == "@web":
+            if self.web:
+                self.stop_web()
+                self.add("info", "  web ui stopped.")
+            else:
+                self.start_web()
+            return
         if key == "@about":
             self.show_about()
             return
@@ -1294,6 +1401,7 @@ class App:
                 self.claude.close()
             subprocess.run([CLAUDE, "auth", "logout"], capture_output=True, timeout=30)
             self.entries.clear()
+            self.entries_gen += 1
             self.lines_cache = None
             self.setup = setup.Setup(self)
             self.setup_return = False
@@ -1302,6 +1410,8 @@ class App:
         self.menu = None
         save_settings(self.cfg)
         changed = [st for st in SETTINGS if st[3] and self.cfg.get(st[0]) != self.menu_before.get(st[0])]
+        if self.cfg.get("web") == "on" and self.menu_before.get("web") != "on" and not self.web:
+            self.start_web()
         if self.cfg["tool_lines"] != self.menu_before["tool_lines"]:
             self.add("info", "  tool output: applies to new results")
         if changed:
@@ -1478,6 +1588,8 @@ class App:
         self.dirty = False
 
     def draw(self):
+        if self.hidden:
+            return
         img = Image.new("RGB", (W, H), BG)
         d = ImageDraw.Draw(img)
         if self.setup:
@@ -1486,7 +1598,7 @@ class App:
             return self.draw_mode(img, d)
         # top bar
         spin = "|/-\\"[int(time.time() * 4) % 4] if self.busy else ""
-        left = ("claude " + spin + " " + self.status) if self.busy else ("claude · " + self.status)
+        left = (spin + " " + self.busy_label()) if self.busy else ("claude · " + self.status)
 
         try:
             cap = open("/sys/class/power_supply/bq27220-0/capacity").read().strip()
@@ -1570,6 +1682,10 @@ class App:
             self.draw_history(d)
         elif self.overlay:
             self.draw_overlay(d)
+        if self.web_splash:
+            self.draw_web_splash(img, d)
+        if self.sudo_req:
+            self.draw_sudo(d)
         self.fb.write(img)
         self.dirty = False
 
@@ -1612,10 +1728,17 @@ class App:
                         self.key(k)
                 self.draw()
                 continue
-            fds = [self.kb.fd]
+            if self.hidden:
+                self.hidden_tick()
+                continue
+            if CAN_HIDE and not self.ctl_alive():
+                raise SystemExit             # launcher script was killed (held esc): close for real
+            fds = [self.kb.fd] + self.sudo_fds() + ([self.web.rfd] if self.web else [])
             if self.claude.alive():
                 fds.append(self.claude.fileno())
             r, _, _ = select.select(fds, [], [], 0.25)
+            self.sudo_poll(r)
+            self.web_tick(r)
             if self.kb.fd in r:
                 for k in self.kb.read():
                     self.key(k)
@@ -1640,8 +1763,383 @@ class App:
             if self.dirty:
                 self.draw()
 
+    # -- sudo password popup: sudo -A runs clawputer-askpass, which connects here --
+    def open_askpass(self):
+        try:
+            if os.path.exists(ASKPASS_SOCK):
+                os.unlink(ASKPASS_SOCK)
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            old = os.umask(0o077)
+            try:
+                s.bind(ASKPASS_SOCK)
+            finally:
+                os.umask(old)
+            s.listen(2)
+            s.setblocking(False)
+            self.sudo_sock = s
+            self.sudo_ino = os.stat(ASKPASS_SOCK).st_ino
+            self.sudo_checked = time.time()
+            self.sudo_clear()        # start clean: a password typed elsewhere mustn't let claude in
+        except OSError as e:
+            log("askpass socket", e)
+
+    def sudo_fds(self):
+        fds = [self.sudo_sock.fileno()] if self.sudo_sock else []
+        if self.sudo_req:
+            fds.append(self.sudo_req["conn"].fileno())
+        return fds
+
+    @staticmethod
+    def sudo_parent(pid):
+        """-> (sudo pid, its command line) if pid's parent really is a running sudo, else None"""
+        try:
+            st = dict(l.split(":", 1) for l in open("/proc/%d/status" % pid).read().splitlines() if ":" in l)
+            ppid = int(st["PPid"])
+            pst = dict(l.split(":", 1) for l in open("/proc/%d/status" % ppid).read().splitlines() if ":" in l)
+            # only the setuid sudo binary can be named sudo AND run with effective uid 0
+            if pst["Name"].strip() != "sudo" or pst["Uid"].split()[1] != "0":
+                return None
+            args = open("/proc/%d/cmdline" % ppid, "rb").read().decode(errors="replace").split("\0")
+            return ppid, " ".join(a for a in args if a)
+        except (OSError, KeyError, ValueError, IndexError):
+            return None
+
+    def sudo_poll(self, r):
+        if self.sudo_sock and time.time() - self.sudo_checked > 5:
+            # someone replaced / removed our socket file (another clawputer that has since
+            # closed?): take it back, or sudo -A can't reach us
+            self.sudo_checked = time.time()
+            try:
+                stolen = os.stat(ASKPASS_SOCK).st_ino != self.sudo_ino
+            except OSError:
+                stolen = True
+            if stolen and not self.sudo_req:
+                log("askpass socket was replaced; reopening")
+                self.sudo_sock.close()
+                self.sudo_sock = None
+                self.open_askpass()
+                return
+        if self.sudo_forget and not self.proc_running(self.sudo_forget):
+            self.sudo_forget = None
+            self.sudo_clear()
+        if self.sudo_req and self.sudo_req["conn"].fileno() in r:
+            try:
+                gone = not self.sudo_req["conn"].recv(256)    # askpass sends its prompt, then waits
+            except OSError:
+                gone = True
+            if gone:                                         # sudo gave up / was killed
+                self.sudo_answer(None)
+        if not self.sudo_sock or self.sudo_sock.fileno() not in r:
+            return
+        try:
+            conn, _ = self.sudo_sock.accept()
+        except OSError:
+            return
+        conn.setblocking(True)
+        conn.settimeout(5)
+        try:
+            conn.recv(256)          # askpass's prompt line. read it now: closing with unread
+        except OSError:             # data would reset the connection and lose our answer
+            pass
+        try:
+            pid = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[0]
+        except OSError:
+            pid = 0
+        who = self.sudo_parent(pid) if pid else None
+        nobody = self.hidden and not (self.web and self.web.active())
+        if who is None or nobody or self.sudo_req:
+            log("askpass: refused (%s)" % ("not sudo" if who is None else "busy/hidden"))
+            try:
+                conn.sendall(b"0")
+            except OSError:
+                pass
+            conn.close()
+            return
+        spid, cmd = who
+        retry = self.sudo_last[0] == spid and time.time() - self.sudo_last[1] < 120
+        self.sudo_req = {"conn": conn, "cmd": cmd, "pw": "", "retry": retry, "pid": spid,
+                         "remember": self.sudo_remember}
+        self.dirty = True
+
+    def sudo_key(self, k):
+        q = self.sudo_req
+        if k == "enter":
+            self.sudo_answer(q["pw"])
+        elif k == "esc":
+            self.sudo_answer(None)
+        elif k == "tab":
+            q["remember"] = not q["remember"]
+        elif k == "backspace":
+            q["pw"] = q["pw"][:-1]
+        elif len(k) == 1:
+            q["pw"] += k
+
+    def sudo_answer(self, pw):
+        q, self.sudo_req = self.sudo_req, None
+        try:
+            q["conn"].sendall(b"0" if pw is None else b"1" + pw.encode())
+        except OSError:
+            pass
+        q["conn"].close()
+        if pw is not None:
+            self.sudo_used = True
+            self.sudo_remember = q["remember"]
+            self.sudo_forget = None if q["remember"] else q["pid"]
+        q["pw"] = pw = ""
+        self.sudo_last = (q["pid"], time.time())
+        self.dirty = True
+
+    @staticmethod
+    def proc_running(pid):
+        try:
+            return "\nState:\tZ" not in open("/proc/%d/status" % pid).read()
+        except OSError:
+            return False
+
+    @staticmethod
+    def sudo_clear():
+        """forget sudo's cached password (timestamp_type=global on Pi OS: it's device-wide)"""
+        try:
+            subprocess.run(["sudo", "-k"], stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log("sudo -k", e)
+
+    def draw_sudo(self, d):
+        q = self.sudo_req
+        cmd = textwrap.wrap(q["cmd"], 50)
+        if len(cmd) > 4:
+            cmd = cmd[:3] + [cmd[3][:47] + "..."]
+        title = "wrong password? try again" if q["retry"] else "claude wants to run as root:"
+        bh = 30 + len(cmd) * 11 + 40
+        top = max(2, (H - bh) // 2)
+        d.rectangle((6, top, W - 6, top + bh), fill=(25, 25, 35), outline=ERR if q["retry"] else ASK)
+        d.text((14, top + 4), title, font=self.small, fill=ERR if q["retry"] else ASK)
+        for i, ln in enumerate(cmd):
+            d.text((14, top + 18 + i * 11), ln, font=self.small, fill=FG)
+        y = top + 22 + len(cmd) * 11
+        d.text((14, y), "sudo password: " + "*" * min(len(q["pw"]), 30) + "_", font=self.small, fill=FG)
+        d.text((14, y + 12), "remember for this chat: " + ("yes" if q["remember"] else "no"),
+               font=self.small, fill=ASK if q["remember"] else DIM)
+        hint = "enter run   tab remember   esc refuse"
+        d.text(((W - self.small.getlength(hint)) // 2, top + bh - 13), hint, font=self.small, fill=DIM)
+
+    # -- web ui (clawputer_web.py): the chat in a phone / pc browser --
+    def start_web(self):
+        if self.web:
+            self.web_splash = self.web.urls()
+            return
+        try:
+            import clawputer_web
+            self.web = clawputer_web.WebUI(CONF, log)
+        except OSError as e:
+            log("web ui", e)
+            self.add("err", "couldn't start the web ui: %s" % e)
+            return
+        self.web_sig = None
+        self.web_splash = self.web.urls()
+        self.add("info", "  web ui on: " + (", ".join(u for _, u in self.web_splash) or "no network?"))
+        self.web_publish()
+
+    def stop_web(self):
+        w, self.web, self.web_splash = self.web, None, None
+        if w:
+            w.close()
+
+    def web_tick(self, r):
+        if not self.web:
+            return
+        if self.web.rfd in r:
+            for a in self.web.actions():
+                try:
+                    self.web_act(a)
+                except Exception as e:           # a bad request mustn't take the chat down
+                    log("web action", a.get("a"), repr(e))
+                self.dirty = True
+        self.web_publish()
+
+    def web_act(self, a):
+        kind = a.get("a")
+        if kind == "send":
+            text = str(a.get("text", "")).strip()
+            if text:
+                saved, self.input = self.input, text
+                self.submit()
+                if self.input == "":
+                    self.input = saved           # keep what's half-typed on the cardputer
+        elif kind == "stop":
+            if self.busy:
+                self.claude.interrupt()
+                self.add("info", "  stopping...")
+        elif kind == "perm":
+            if self.pending and self.pending["id"] == a.get("id") and a.get("k") in ("y", "n", "a"):
+                self.answer_pending(a["k"])
+        elif kind == "ask_answer":
+            if self.ask and self.ask["id"] == a.get("id") and self.ask["qi"] == a.get("qi"):
+                self.ask["typing"] = False
+                self.ask_answer(str(a.get("answer", ""))[:2000])
+        elif kind == "ask_skip":
+            if self.ask and self.ask["id"] == a.get("id"):
+                self.claude.answer(self.ask["id"], False, self.ask["input"])
+                self.add("info", "  ✗ skipped the question")
+                self.ask = None
+        elif kind == "sudo":
+            q = self.sudo_req
+            if q and q["pid"] == a.get("pid"):
+                if a.get("pw") is None:
+                    self.sudo_answer(None)
+                else:
+                    q["remember"] = bool(a.get("remember"))
+                    self.sudo_answer(str(a["pw"]))
+        elif kind == "new":
+            self.hist = None
+            self.new_chat()
+        elif kind == "chats":
+            self.web_chats = [{"id": c["id"], "title": c["title"][:80], "ago": ago(c["mtime"])} for c in list_chats()]
+        elif kind == "open":
+            for c in list_chats():
+                if c["id"] == a.get("id"):
+                    self.hist = None
+                    if c["id"] != self.session_id or not self.claude.alive():
+                        self.open_chat(c)
+                    break
+        elif kind == "set":
+            st = [x for x in SETTINGS if x[0] == a.get("key") and x[2]]
+            if st and a.get("value") in st[0][2] and self.menu is None:
+                self.menu_before = dict(self.cfg)
+                self.cfg[st[0][0]] = a["value"]
+                if st[0][0] == "font":
+                    self.set_font(int(self.cfg["font"]))
+                self.close_menu()
+        elif kind == "key":
+            k = a.get("k")
+            if isinstance(k, str) and k and k != "ctrl+q":
+                self.key(k)
+
+    def web_publish(self):
+        w = self.web
+        if not w:
+            return
+        w.screen = self.fb.prev
+        q, p, ask = self.sudo_req, self.pending, self.ask
+        st = {
+            "status": self.status, "busy": self.busy, "batt": battery_clock(), "hidden": self.hidden,
+            "session": self.session_id, "queue": len(self.queue), "cfg": self.cfg,
+            "settings": [[k, label, ch] for k, label, ch, _ in SETTINGS if ch],
+            "pending": {"id": p["id"], "name": p["name"], "desc": short_tool(p["name"], p["input"])} if p else None,
+            "sudo": {"pid": q["pid"], "cmd": q["cmd"], "retry": q["retry"], "remember": q["remember"]} if q else None,
+            "chats": self.web_chats, "ask": None,
+            "turn": None,
+        }
+        if self.busy and self.turn:
+            tu = self.turn
+            st["turn"] = {"phase": "waiting for you" if (p or ask or q) else tu["phase"],
+                          "tokens": self.turn_tokens()}
+        if ask:
+            qq = ask["qs"][ask["qi"]]
+            st["ask"] = {"id": ask["id"], "qi": ask["qi"], "n": len(ask["qs"]), "header": qq.get("header", ""),
+                         "question": qq.get("question", ""), "multi": bool(qq.get("multiSelect")),
+                         "options": [{"label": o.get("label", "?"), "description": o.get("description", "")}
+                                     for o in qq.get("options", [])]}
+        sig = (self.entries_gen, len(self.entries), json.dumps(st, sort_keys=True, default=str))
+        if sig != self.web_sig:
+            self.web_sig = sig
+            if st["turn"]:
+                st["turn"]["secs"] = time.time() - (self.t_start or time.time())   # browser counts on
+            w.publish(self.entries, self.entries_gen, st)
+
+    def draw_web_splash(self, img, d):
+        import qrcode
+        urls = self.web_splash
+        key = self.web.key if self.web else ""
+        d.rectangle((0, 0, W, H), fill=BG)
+        d.text((8, 4), "web ui", font=self.font, fill=ACCENT)
+        if not urls:
+            d.text((8, 30), "no network: connect to wi-fi first", font=self.small, fill=ERR)
+            d.text((8, H - 13), "any key to close", font=self.small, fill=DIM)
+            return
+        qr = qrcode.QRCode(border=2, box_size=1)
+        qr.add_data(urls[0][1] + "?k=" + key)
+        qr.make(fit=True)
+        q = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+        scale = max(1, 140 // q.size[0])
+        q = q.resize((q.size[0] * scale, q.size[1] * scale), Image.NEAREST)
+        img.paste(q, (W - q.size[0] - 8, (H - q.size[1]) // 2 + 4))
+        x, y = 8, 24
+        d.text((x, y), "scan, or open on your phone:", font=self.small, fill=DIM)
+        y += 14
+        for ifc, u in urls[:3]:
+            label = "tailscale" if ifc.startswith("tailscale") else ("wi-fi" if ifc.startswith("wl") else ifc)
+            d.text((x, y), label, font=self.small, fill=DIM)
+            d.text((x, y + 11), u.replace("http://", "").rstrip("/"), font=self.small, fill=FG)
+            y += 26
+        d.text((x, y + 2), "key: " + key, font=self.font, fill=ASK)
+        d.text((x, H - 13), "any key to close", font=self.small, fill=DIM)
+
+    # -- hide / show (esc on an empty box; the launcher script brings us back with SIGUSR1) --
+    def ctl_alive(self):
+        try:
+            pid = int(read_file(CTL_FILE))
+            return "clawputer" in open("/proc/%d/cmdline" % pid).read()
+        except (ValueError, OSError):
+            return False
+
+    def set_state(self, st):
+        try:
+            with open(STATE_FILE + ".tmp", "w") as f:
+                f.write(st)
+            os.replace(STATE_FILE + ".tmp", STATE_FILE)
+        except OSError as e:
+            log("state", e)
+
+    def hide(self):
+        if self.sudo_req:
+            return                           # answer the password popup first
+        self.save_draft()
+        self.kb.close()                      # let go of the keyboard so the launcher gets it
+        self.kb = None
+        self.hidden = True
+        self.want_show = False
+        self.set_state("hidden")             # the launcher script sees this, exits and wakes the launcher
+
+    def show(self):
+        self.hidden = False
+        self.kb = Keyboard()
+        self.fb.prev = None                  # the launcher drew over us: repaint everything
+        self.dirty = True
+        self.last_key = time.time()
+        self.set_state("shown")
+
+    def hidden_tick(self):
+        # keep reading claude so its replies (and our chat) stay up to date, but draw nothing
+        fds = [self.claude.fileno()] if self.claude and self.claude.alive() else []
+        r, _, _ = select.select(fds + self.sudo_fds() + ([self.web.rfd] if self.web else []), [], [], 0.5)
+        self.sudo_poll(r)                    # (says no while hidden, unless a browser is open)
+        self.web_tick(r)
+        if fds and fds[0] in r:
+            msgs = self.claude.read()
+            if msgs is None:
+                self.busy = False
+                self.add("err", "claude stopped. enter = restart.")
+            else:
+                for m in msgs:
+                    self.handle(m)
+        if self.want_show:
+            self.show()
+
     def close(self):
         try:
+            if self.sudo_req:
+                self.sudo_answer(None)
+            if self.sudo_used:
+                self.sudo_clear()
+            if self.web:
+                self.stop_web()
+            if self.sudo_sock:
+                self.sudo_sock.close()
+                try:
+                    os.unlink(ASKPASS_SOCK)
+                except OSError:
+                    pass
             if self.setup:
                 self.setup.close()
             self.save_draft()
@@ -1649,9 +2147,12 @@ class App:
                 self.claude.close()
         finally:
             try:
-                self.kb.close()
+                if self.kb:
+                    self.kb.close()
             finally:
                 self.fb.close()
+                if CAN_HIDE:
+                    self.set_state("closed")
 
 
 BOOST = "/usr/local/sbin/clawputer-boost"
@@ -1720,7 +2221,17 @@ def install_claude_md():
 
 def main():
     os.makedirs(os.path.dirname(LOGFILE), exist_ok=True)
+    def bye(*_):
+        raise SystemExit
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGHUP, bye)
     app = App(sys.argv[1:])
+    if CAN_HIDE:
+        app.set_state("shown")
+
+        def wake(*_):
+            app.want_show = True
+        signal.signal(signal.SIGUSR1, wake)
     try:
         app.run()
     except (SystemExit, KeyboardInterrupt):

@@ -23,7 +23,8 @@ Type=Application
 EOF
 chmod 644 "$A/applications/clawputer.desktop"
 
-install -m 644 src/clawputer_gui.py src/clawputer_setup.py src/CLAUDE.md src/CLAUDE.remote.md VERSION "$S/"
+install -m 644 src/clawputer_gui.py src/clawputer_setup.py src/clawputer_web.py src/CLAUDE.md src/CLAUDE.remote.md VERSION "$S/"
+install -m 755 src/clawputer-askpass "$S/"
 install -m 755 src/boost/clawputer-boost src/boost/clawputer-bootmode src/boost/enable-boost.sh src/boost/disable-boost.sh "$S/boost/"
 install -m 644 LICENSE "$PKG/usr/share/doc/clawputer/copyright"
 

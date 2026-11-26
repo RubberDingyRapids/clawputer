@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""sudo askpass helper for Clawputer (SUDO_ASKPASS): asks the chat GUI to show a password
+popup, then hands what the user typed straight to sudo on stdout. The GUI only answers when
+our parent really is sudo, so the password never reaches Claude or the chat."""
+import os
+import socket
+import sys
+
+path = os.environ.get("CLAWPUTER_ASKPASS_SOCK") or os.path.expanduser("~/.config/clawputer/askpass.sock")
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(path)
+    s.sendall((sys.argv[1] if len(sys.argv) > 1 else "password").encode()[:200] + b"\n")
+    data = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+except OSError:
+    sys.stderr.write("clawputer-askpass: the Clawputer chat isn't open\n")
+    sys.exit(1)
+if not data.startswith(b"1"):
+    sys.stderr.write("clawputer-askpass: cancelled\n")
+    sys.exit(1)
+sys.stdout.buffer.write(data[1:] + b"\n")
