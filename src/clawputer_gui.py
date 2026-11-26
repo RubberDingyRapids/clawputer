@@ -610,7 +610,7 @@ class App:
         self.status = "ready"
         if not resume and not quiet:
             self.add("info", "new chat. type a message. ctrl+q quits." +
-                     (" esc on an empty box hides it, it keeps going." if CAN_HIDE else ""))
+                     (" ctrl+h hides it, it keeps going." if CAN_HIDE else ""))
 
     def add(self, kind, text):
         self.entries.append((kind, text))
@@ -898,6 +898,9 @@ class App:
             return
         if k in ("f3", "ctrl+o"):
             self.open_history()
+            return
+        if k == "ctrl+h" and CAN_HIDE and not self.menu_mode:
+            self.hide()                      # minimise any time, even mid-reply
             return
         if self.pending:
             if k in ("y", "Y", "a", "A", "n", "N", "esc"):
@@ -1193,6 +1196,7 @@ class App:
             "fn+f / fn+x  scroll a line",
             "fn+z / fn+c  scroll a page",
             "esc          stop claude / clear box" + (" / hide" if CAN_HIDE else ""),
+            "ctrl+h       hide (claude keeps going)",
             "y  n  a      answer permission prompts",
             "F2           settings",
             "F3           chats (n new, d delete)",
