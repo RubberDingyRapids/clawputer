@@ -39,6 +39,7 @@ and built-in keyboard.
 | F1 | help (all the keys) |
 | F2 / Ctrl+S | settings (`f`/`x` move, Enter open, Esc back) |
 | F3 / Ctrl+O | chats (`n` new, `d` delete) |
+| Ctrl+H | hide the chat and go back to the launcher; Claude keeps going. Open Clawputer again to come back |
 | Ctrl+Q or `/exit` | quit (`/new` starts a fresh chat) |
 
 ### Web UI (phone / PC)
