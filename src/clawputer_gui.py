@@ -27,6 +27,7 @@ import select
 import signal
 import socket
 import struct
+import threading
 import subprocess
 import sys
 import textwrap
@@ -380,6 +381,28 @@ def ago(t):
 # ---------------------------------------------------------------------------
 # Claude headless session
 # ---------------------------------------------------------------------------
+class NetCheck(threading.Thread):
+    """background check: can claude reach what it needs? (anthropic's api, or the pc in pc mode)"""
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.target = (RCFG.get("host", ""), int(RCFG.get("port", 22))) if REMOTE else ("api.anthropic.com", 443)
+        self.online = None          # None = not checked yet
+        self.changed = False
+        self.start()
+
+    def run(self):
+        while True:
+            try:
+                socket.create_connection(self.target, timeout=5).close()
+                ok = True
+            except (OSError, ValueError):
+                ok = False
+            if ok != self.online:
+                self.online = ok
+                self.changed = True
+            time.sleep(15 if ok else 4)
+
+
 class ClaudeSession:
     def __init__(self, extra_args, resume=None, cwd=None):
         args = [CLAUDE, "-p", "--input-format", "stream-json", "--output-format", "stream-json",
@@ -554,6 +577,7 @@ class App:
         self.entries_gen = 0       # bumped whenever the chat is cleared / switched
         self.turn = None           # live progress while claude works: phase, tokens (see on_stream)
         self.menu_mode = "--menu" in self.extra_args
+        self.net = None if self.menu_mode else NetCheck()
         self.extra_args = [a for a in self.extra_args if a != "--menu"]
         self.splash("starting clawputer...")
         if not self.menu_mode and not REMOTE:
@@ -1132,6 +1156,11 @@ class App:
         if text in ("/new", "/clear"):
             self.new_chat()
             return
+        if self.offline() and not self.busy:
+            self.queue.append(text)
+            self.lines_cache = None
+            self.add("info", "  offline: it'll send when you're back online.")
+            return
         if self.busy:
             # claude answers in order, so hold this until the current reply finishes;
             # otherwise it would show up above the answer to the previous message
@@ -1139,6 +1168,18 @@ class App:
             self.lines_cache = None
             return
         self.send_user(text)
+
+    def offline(self):
+        return bool(self.net) and self.net.online is False
+
+    def net_tick(self):
+        """connection came / went: redraw; back online -> send what was held"""
+        if not self.net or not self.net.changed:
+            return
+        self.net.changed = False
+        self.dirty = True
+        if self.net.online and self.queue and not self.busy and not self.parked and self.claude:
+            self.send_user(self.queue.pop(0))
 
     def send_user(self, text):
         if not self.claude.alive():
@@ -1633,6 +1674,9 @@ class App:
         # top bar
         spin = "|/-\\"[int(time.time() * 4) % 4] if self.busy else ""
         left = (spin + " " + self.busy_label()) if self.busy else ("claude · " + self.status)
+        offline = self.offline()
+        if offline and not self.busy:
+            left = "claude · offline: " + ("can't reach your pc" if REMOTE else "no internet")
 
         try:
             cap = open("/sys/class/power_supply/bq27220-0/capacity").read().strip()
@@ -1640,7 +1684,7 @@ class App:
             right = "%s%s%% %s" % ("+" if chg else "", cap, time.strftime("%H:%M"))
         except OSError:
             right = time.strftime("%H:%M")
-        d.text((3, 0), left[:40], font=self.small, fill=ACCENT)
+        d.text((3, 0), left[:40], font=self.small, fill=ERR if offline else ACCENT)
         d.text((W - 3 - self.small.getlength(right), 0), right, font=self.small, fill=DIM)
         d.line((0, 11, W, 11), fill=BAR)
         # conversation
@@ -1792,6 +1836,7 @@ class App:
                 else:
                     for m in msgs:
                         self.handle(m)
+            self.net_tick()
             if self.busy or time.time() - self.last_clock > 20:
                 self.dirty = True
                 self.last_clock = time.time()
@@ -2292,6 +2337,7 @@ class App:
                 self.park("── claude waited 10 min for you while hidden, so it was stopped. ──")
         elif self.parked and self.boosted:
             self.boost(False)
+        self.net_tick()
         if self.want_show:
             self.show()
 
