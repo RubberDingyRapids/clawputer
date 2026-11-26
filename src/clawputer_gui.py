@@ -634,7 +634,7 @@ class App:
         self.status = "ready"
         if not resume and not quiet:
             self.add("info", "new chat. type a message. ctrl+q quits." +
-                     (" ctrl+h hides it, it keeps going." if CAN_HIDE else ""))
+                     (" ctrl+h minimises the app, claude keeps going." if CAN_HIDE else ""))
 
     def add(self, kind, text):
         self.entries.append((kind, text))
@@ -1236,12 +1236,13 @@ class App:
             "enter        send message",
             "fn+f / fn+x  scroll a line",
             "fn+z / fn+c  scroll a page",
-            "esc          stop claude / clear box" + (" / hide" if CAN_HIDE else ""),
-            "ctrl+h       hide (claude keeps going)",
+            "esc          stop claude / clear box",
+        ] + (["ctrl+h       minimise app (claude keeps going)"] if CAN_HIDE else []) + [
             "y  n  a      answer permission prompts",
             "F2           settings",
             "F3           chats (n new, d delete)",
-            "ctrl+q       quit     /new  new chat",
+            "/new         new chat",
+            "ctrl+q       quit",
         ])
 
     def show_about(self):
