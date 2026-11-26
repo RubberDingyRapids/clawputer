@@ -1,133 +1,71 @@
 #!/bin/bash
 # Clawputer launcher (CardputerZero).
-# Shows the GUI mode screen (first run: install Claude Code + sign in), then runs Claude where
-# you picked: on this Cardputer or on your PC over SSH, in the chat GUI.
-# The only terminal bits are the RAM-boost password prompt and its reboot.
+# APPLaunch starts this as a normal (non-terminal) app: it stops drawing, hands us the screen
+# and waits until this script exits. We show the GUI mode screen (first run: install Claude
+# Code + sign in), then start the chat as a small systemd user service (clawputer-chat).
+# Esc on an empty message box minimises the chat: it lets go of the screen and keyboard, this
+# script exits and the launcher comes back, while the chat keeps going in the background.
+# Opening Clawputer again wakes it up, straight back into the chat.
 SHARE=/usr/share/clawputer
 CONF="$HOME/.config/clawputer"; mkdir -p "$CONF"
 GUI="$SHARE/clawputer_gui.py"
-WARN="$CONF/esc_warning"
+UNIT=clawputer-chat
+STATE="$CONF/gui.state"    # the chat writes shown / hidden
 BOOST=/usr/local/sbin/clawputer-boost
-BOOTMODE=/usr/local/sbin/clawputer-bootmode
-CLAUDE="$HOME/.local/bin/claude"; [ -x "$CLAUDE" ] || CLAUDE=$(command -v claude || echo "$CLAUDE")
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+echo $$ > "$CONF/gui.ctl"  # the chat on screen checks we're still here
 
-gpu_mb(){ vcgencmd get_mem gpu 2>/dev/null | tr -dc 0-9; }
 boost_ok(){ [ -x "$BOOST" ] && sudo -n -l "$BOOST" on >/dev/null 2>&1; }
-flush_keys(){ while read -rsn1 -t 0.05 _; do :; done; }
+chat_running(){ systemctl --user is-active --quiet "$UNIT"; }
+chat_pid(){ systemctl --user show -p MainPID --value "$UNIT" 2>/dev/null; }
+gui_state(){ local st=; read -r st < "$STATE" 2>/dev/null; echo "$st"; }
 
-show_warning(){
-  [ -f "$WARN" ] || return 0
-  clear; echo "heads up:"; cat "$WARN"; echo
-  echo "next time use ctrl+q / /exit to quit,"
-  echo "not holding esc."
-  rm -f "$WARN"; read -rsn1 -t 20 -p "any key..." _; echo
+# stay here (so the launcher keeps out of the way) while the chat is on screen
+wait_chat(){
+  local p=$1
+  while [ -e "/proc/$p" ] && [ "$(gui_state)" != hidden ]; do sleep 0.3; done
 }
 
-LPID=
-resume_launcher(){ [ -n "$LPID" ] && kill -CONT "$LPID" 2>/dev/null; LPID=; }
-
-# full-screen gui with the launcher paused (its status bar would draw over it)
-run_gui(){
-  sleep 0.3; printf '\033[?25l'; clear
-  PYTHONPATH="$SHARE" python3 "$GUI" "$@" < /dev/null 2>>"$CONF/gui.log" &
-  local gp=$!
-  LPID=$(pgrep -o -f M5CardputerZero-APPLaunch)
-  if [ -n "$LPID" ]; then
-    # safety net: unpause the launcher when the gui ends, even if this script is killed
-    setsid bash -c "while [ -e /proc/$gp ] && ! grep -q '^State:.*Z' /proc/$gp/status 2>/dev/null; do sleep 1; done; kill -CONT $LPID" \
-      >/dev/null 2>&1 < /dev/null &
-    sleep 0.5; kill -STOP "$LPID" 2>/dev/null
-  fi
-  wait "$gp"
-  resume_launcher
-  printf '\033[?25h'; flush_keys
-}
-
-# ---------------- stage 2: run Claude on the Cardputer (with the RAM boost if chosen) ----------------
-if [ "${CLAWPUTER_STAGE:-}" = run ]; then
-  GUARD=; HUPPED=
-  restore(){
-    trap - EXIT HUP TERM INT
-    resume_launcher; printf '\033[?25h'
-    [ -n "$GUARD" ] && kill "$GUARD" 2>/dev/null
-    if [ -n "${CLAWPUTER_BOOST:-}" ]; then
-      echo "restoring..."
-      systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber 2>/dev/null
-      sudo -n "$BOOST" off
-    fi
-    if [ -n "$HUPPED" ]; then
-      { echo "clawputer was force-closed (held esc)."
-        [ -n "${CLAWPUTER_BOOST:-}" ] && echo "everything was put back."
-        [ "$(gpu_mb)" -le 16 ] 2>/dev/null && echo "low gpu memory + camera off until a reboot."; } > "$WARN"
-      exit 0
-    fi
-    if [ "$(gpu_mb)" -le 16 ] 2>/dev/null && boost_ok; then
-      echo; echo "reboot back to normal?"; echo "(gives gpu memory back"; echo " + turns camera on) y/n"
-      if read -rsn1 -t 30 k && { [ "$k" = y ] || [ "$k" = Y ]; }; then
-        echo "rebooting..."; sudo -n "$BOOTMODE" exit; sleep 60
-      fi
-    fi
+# ---- a minimised chat? wake it up ----
+if chat_running; then
+  P=$(chat_pid)
+  if [ "$(gui_state)" = hidden ] && [ -n "$P" ] && [ "$P" != 0 ]; then
+    echo waking > "$STATE"
+    kill -USR1 "$P"
+    wait_chat "$P"
     exit 0
-  }
-  trap restore EXIT
-  trap 'HUPPED=1; exit' HUP TERM
-
-  if [ -n "${CLAWPUTER_BOOST:-}" ]; then
-    echo "freeing ram..."
-    systemctl --user stop xdg-desktop-portal xdg-desktop-portal-gtk xdg-desktop-portal-wlr \
-      xdg-document-portal xdg-permission-store mpris-proxy filter-chain 'gvfs-*' \
-      wireplumber pipewire-pulse pipewire pipewire.socket pipewire-pulse.socket 2>/dev/null
-    sudo -n "$BOOST" on
-    ME=$$
-    setsid bash -c "while [ -e /proc/$ME ] && ! grep -q '^State:.*Z' /proc/$ME/status 2>/dev/null; do sleep 2; done
-      systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber
-      sudo -n $BOOST off
-      printf 'clawputer was force-closed.\neverything was put back.\n' > '$WARN'" >/dev/null 2>&1 < /dev/null &
-    GUARD=$!
   fi
-  export DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAWPUTER_CHECKED=1
-  mkdir -p "$HOME/clawputer"; cd "$HOME/clawputer" || exit 1
-  run_gui "$@"
-  exit 0
+  # running but not minimised (stuck, or still closing): close it properly, start fresh
+  systemctl --user stop "$UNIT"
 fi
+systemctl --user reset-failed "$UNIT" >/dev/null 2>&1
 
-# ---------------- stage 1: mode screen ----------------
-clear; echo "starting clawputer..."
-show_warning
-while true; do
-  rm -f "$CONF/choice"
-  run_gui --menu
-  CHOICE=$(cat "$CONF/choice" 2>/dev/null || echo quit)
-  case "$CHOICE" in
-    boost-setup-max|boost-setup-local)
-      clear
-      echo "== RAM boost setup =="
-      echo "installs 2 small helpers so clawputer"
-      echo "can pause background services while"
-      echo "claude runs (undo any time). enter"
-      echo "your password:"
-      echo
-      if sudo "$SHARE/boost/enable-boost.sh"; then
-        if [ "$CHOICE" = boost-setup-max ]; then
-          echo; echo "restarting with more ram..."; echo "open Clawputer again after it restarts."
-          sleep 2; sudo -n "$BOOTMODE" enter; sleep 60; exit 0
-        fi
-        CHOICE=local; break
-      fi
-      echo "not enabled."; sleep 2; continue;;
-    reboot)
-      clear; echo "restarting with more ram..."; echo "open Clawputer again after it restarts."
-      sleep 2; sudo -n "$BOOTMODE" enter; sleep 60; exit 0;;
-    local|local-noboost|pc) break;;
-    *) clear; exit 0;;
-  esac
-done
+# ---- mode screen (the GUI does the install / sign-in / ram boost setup itself) ----
+rm -f "$CONF/choice"
+PYTHONPATH="$SHARE" python3 "$GUI" --menu < /dev/null >/dev/null 2>>"$CONF/gui.log"
+CHOICE=$(cat "$CONF/choice" 2>/dev/null || echo quit)
 
-if [ "$CHOICE" = pc ]; then
-  export CLAWPUTER_REMOTE=1 CLAUDE_REMOTE=1 CLAWPUTER_CHECKED=1
-  run_gui; exit 0
-fi
+ENV=(-E CLAWPUTER_HIDE=1 -E CLAWPUTER_CHECKED=1 -E PYTHONPATH="$SHARE" -E PATH="$PATH"
+     -E LANG="${LANG:-C.UTF-8}" -E DISABLE_AUTOUPDATER=1 -E CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1)
+[ -n "${APPLAUNCH_LINUX_FBDEV_DEVICE:-}" ] && ENV+=(-E APPLAUNCH_LINUX_FBDEV_DEVICE="$APPLAUNCH_LINUX_FBDEV_DEVICE")
+case "$CHOICE" in
+  pc)            ENV+=(-E CLAWPUTER_REMOTE=1 -E CLAUDE_REMOTE=1);;
+  local)         boost_ok && ENV+=(-E CLAWPUTER_BOOST=1);;
+  local-noboost) ;;
+  *)             exit 0;;
+esac
 
-[ "$CHOICE" = local ] && boost_ok && export CLAWPUTER_BOOST=1
-export CLAWPUTER_STAGE=run CLAWPUTER_UI=gui
-exec "$0" "$@"
+# ---- the chat, as a user service so it can outlive this script when minimised ----
+# OOMScoreAdjust: if memory ever runs out, the kernel picks claude, not the launcher.
+# ExecStopPost: however the chat ends (quit, crash, killed), the ram boost gets put back.
+mkdir -p "$HOME/clawputer"
+rm -f "$STATE"
+systemd-run --user --quiet --collect --unit="$UNIT" --working-directory="$HOME/clawputer" \
+  -p OOMScoreAdjust=500 -p KillMode=mixed -p TimeoutStopSec=20 \
+  -p StandardError="append:$CONF/gui.log" -p ExecStopPost="$SHARE/clawputer-cleanup" \
+  "${ENV[@]}" python3 "$GUI" || exit 1
+P=
+for _ in $(seq 1 20); do P=$(chat_pid); [ -n "$P" ] && [ "$P" != 0 ] && break; sleep 0.1; done
+[ -n "$P" ] && [ "$P" != 0 ] && wait_chat "$P"
+exit 0

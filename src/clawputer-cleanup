@@ -1,0 +1,11 @@
+#!/bin/bash
+# Runs after the clawputer-chat service stops, however it ended (quit, crash, killed):
+# if the ram boost is still on, put the paused background services back.
+CONF="$HOME/.config/clawputer"
+rm -f "$CONF/gui.state"
+if [ -e "$CONF/boost.on" ]; then
+  systemctl --user --no-block start pipewire.socket pipewire-pulse.socket wireplumber 2>/dev/null
+  sudo -n /usr/local/sbin/clawputer-boost off >/dev/null 2>&1
+  rm -f "$CONF/boost.on"
+fi
+exit 0

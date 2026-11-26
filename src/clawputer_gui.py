@@ -48,7 +48,12 @@ SETTINGS_FILE = os.path.join(CONF, "gui.json")
 DRAFTS_FILE = os.path.join(CONF, "drafts.json")
 STATE_FILE = os.path.join(CONF, "gui.state")   # "shown" / "hidden", read by the launcher script
 CTL_FILE = os.path.join(CONF, "gui.ctl")       # pid of the launcher script showing us right now
-CAN_HIDE = False   # hiding in the background was removed in 0.2.3 (RAM pressure froze the device)
+# esc on an empty box minimises the chat (it runs as the clawputer-chat user service, see the
+# launcher script). While minimised and idle, claude itself is stopped to give its RAM back
+# and resumed (same chat) when you come back.
+CAN_HIDE = os.environ.get("CLAWPUTER_HIDE") == "1"
+BOOST_FLAG = os.path.join(CONF, "boost.on")      # exists while the RAM boost is on (cleanup hook)
+HIDDEN_MIN_MB = 60      # minimised and free RAM below this: stop claude even if it's working
 ASKPASS_SOCK = os.path.join(CONF, "askpass.sock")   # sudo -A password popups (see clawputer-askpass)
 SHARE = os.path.dirname(os.path.abspath(__file__))
 
@@ -157,9 +162,10 @@ class Framebuffer:
             self.mem[o:o + rowbytes] = px[row * rowbytes:(row + 1) * rowbytes]
         self.prev = img.copy()
 
-    def close(self):
+    def close(self, blank=True):
         try:
-            self.write(Image.new("RGB", (W, H), (0, 0, 0)))
+            if blank:
+                self.write(Image.new("RGB", (W, H), (0, 0, 0)))
             self.mem.close()
         finally:
             os.close(self.fd)
@@ -530,6 +536,11 @@ class App:
         self.pc_after_setup = False
         self.hidden = False
         self.want_show = False
+        self.hidden_since = 0
+        self.parked = False        # minimised: claude stopped to save RAM, resumes on wake
+        self.boosted = False
+        self.boost_wanted = os.environ.get("CLAWPUTER_BOOST") == "1" and not REMOTE
+        self.reboot_after = False  # "reboot back to normal?" said yes on quit
         self.sudo_sock = None      # listening socket for sudo password popups
         self.sudo_req = None       # popup on screen: {"conn", "cmd", "pw", "retry"}
         self.sudo_last = (0, 0)    # (sudo pid, time) of the last answer, to spot a wrong password
@@ -588,15 +599,18 @@ class App:
         self.lines_cache = None
 
     # -- session --
-    def start_claude(self, resume=None):
+    def start_claude(self, resume=None, quiet=False):
         if self.claude:
             self.claude.close()
+        if self.boost_wanted and not self.boosted:
+            self.boost(True)
         self.claude = ClaudeSession(claude_args(self.cfg) + list(self.extra_args), resume=resume, cwd=self.cwd)
         self.busy = False
         self.pending = None
         self.status = "ready"
-        if not resume:
-            self.add("info", "new chat. type a message. ctrl+q quits.")
+        if not resume and not quiet:
+            self.add("info", "new chat. type a message. ctrl+q quits." +
+                     (" esc on an empty box hides it, it keeps going." if CAN_HIDE else ""))
 
     def add(self, kind, text):
         self.entries.append((kind, text))
@@ -890,6 +904,7 @@ class App:
                 self.answer_pending(k)
             return
         if k == "ctrl+q":
+            self.ask_reboot_back()
             raise SystemExit
         if k == "up":
             self.scroll += 1
@@ -1100,6 +1115,7 @@ class App:
         self.input = ""
         self.scroll = 0
         if text in ("/exit", "/quit"):
+            self.ask_reboot_back()
             raise SystemExit
         if text in ("/settings", "/s"):
             self.open_menu()
@@ -1176,7 +1192,7 @@ class App:
             "enter        send message",
             "fn+f / fn+x  scroll a line",
             "fn+z / fn+c  scroll a page",
-            "esc          stop claude / clear box",
+            "esc          stop claude / clear box" + (" / hide" if CAN_HIDE else ""),
             "y  n  a      answer permission prompts",
             "F2           settings",
             "F3           chats (n new, d delete)",
@@ -1314,6 +1330,20 @@ class App:
             self.choose(key)
 
     def choose(self, choice):
+        if choice in ("boost-setup-max", "boost-setup-local"):
+            if not self.setup_boost():
+                self.dirty = True
+                return                                   # back to the menu
+            choice = "reboot" if choice == "boost-setup-max" else "local"
+        if choice == "reboot":
+            self.splash("restarting with more ram...\nopen Clawputer again after it restarts.")
+            try:
+                subprocess.run(["sudo", "-n", BOOTMODE, "enter"], stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=60)
+                time.sleep(60)                           # the reboot takes us down
+            except (OSError, subprocess.TimeoutExpired) as e:
+                log("bootmode enter", e)
+            choice = "local"                             # didn't reboot: just run it
         try:
             os.makedirs(CONF, exist_ok=True)
             with open(os.path.join(CONF, "choice"), "w") as f:
@@ -1732,7 +1762,8 @@ class App:
                 self.hidden_tick()
                 continue
             if CAN_HIDE and not self.ctl_alive():
-                raise SystemExit             # launcher script was killed (held esc): close for real
+                self.hide()                  # the launcher script went away: give the screen back
+                continue
             fds = [self.kb.fd] + self.sudo_fds() + ([self.web.rfd] if self.web else [])
             if self.claude.alive():
                 fds.append(self.claude.fileno())
@@ -2075,6 +2106,103 @@ class App:
         d.text((x, y + 2), "key: " + key, font=self.font, fill=ASK)
         d.text((x, H - 13), "any key to close", font=self.small, fill=DIM)
 
+    # -- small blocking dialogs (things that used to be typed in a terminal) --
+    def dialog(self, title, lines, password=False, hint=None, timeout=None, err=False):
+        """-> typed text (password=True) or the key pressed; None on esc / timeout"""
+        pw, t0 = "", time.time()
+        self.kb.read()                                   # drop keys pressed before it showed
+        while True:
+            img = Image.new("RGB", (W, H), BG)
+            d = ImageDraw.Draw(img)
+            body = [ln for line in lines for ln in (textwrap.wrap(line, 50) or [""])]
+            bh = 26 + len(body) * 11 + (14 if password else 0) + 16
+            top = max(2, (H - bh) // 2)
+            d.rectangle((6, top, W - 6, top + bh), fill=(25, 25, 35), outline=ERR if err else ASK)
+            d.text((14, top + 4), title, font=self.small, fill=ERR if err else ASK)
+            for i, ln in enumerate(body):
+                d.text((14, top + 18 + i * 11), ln, font=self.small, fill=FG)
+            if password:
+                d.text((14, top + 20 + len(body) * 11), "password: " + "*" * min(len(pw), 30) + "_",
+                       font=self.small, fill=FG)
+            hint = hint or ("enter ok   esc cancel" if password else "")
+            d.text(((W - self.small.getlength(hint)) // 2, top + bh - 13), hint, font=self.small, fill=DIM)
+            self.fb.write(img)
+            r, _, _ = select.select([self.kb.fd], [], [], 1.0)
+            if timeout and time.time() - t0 > timeout:
+                return None
+            for k in (self.kb.read() if r else []):
+                if k == "esc":
+                    return None
+                if not password:
+                    return k
+                if k == "enter":
+                    return pw
+                if k == "backspace":
+                    pw = pw[:-1]
+                elif len(k) == 1:
+                    pw += k
+
+    def setup_boost(self):
+        """install the RAM boost helpers (needs the password once). -> True when done"""
+        err = False
+        for _ in range(3):
+            pw = self.dialog("ram boost setup" if not err else "wrong password? try again",
+                             ["installs 2 small helpers so clawputer can pause background "
+                              "services while claude runs (undo any time).", "enter your password:"],
+                             password=True, err=err)
+            if pw is None:
+                return False
+            self.splash("setting up the ram boost...")
+            try:
+                p = subprocess.run(["sudo", "-S", "-k", "-p", "", os.path.join(SHARE, "boost", "enable-boost.sh")],
+                                   input=(pw + "\n").encode(), capture_output=True, timeout=120)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                log("boost setup", e)
+                p = None
+            pw = ""
+            if p is not None and p.returncode == 0:
+                return True
+            if p is not None:
+                log("boost setup", p.returncode, p.stderr.decode(errors="replace")[-300:])
+            err = True
+        return False
+
+    def ask_reboot_back(self):
+        """quitting after a max-boost restart: offer to reboot back to normal"""
+        self.reboot_after = False
+        if REMOTE or not self.kb or gpu_mb() > 16 or not boost_state()[0]:
+            return
+        k = self.dialog("reboot back to normal?",
+                        ["gives the gpu memory back and turns the camera on again."],
+                        hint="y reboot   any other key no", timeout=30)
+        self.reboot_after = k in ("y", "Y")
+
+    def boost(self, on):
+        """RAM boost on/off: pause background services while claude runs here"""
+        if on == self.boosted or REMOTE:
+            return
+        if not self.hidden:
+            self.splash("freeing ram..." if on else "putting things back...")
+        run = lambda *a: subprocess.run(list(a), stdin=subprocess.DEVNULL, capture_output=True, timeout=90)
+        try:
+            if on:
+                open(BOOST_FLAG, "w").close()            # the cleanup hook undoes it if we crash
+                run("systemctl", "--user", "stop", "xdg-desktop-portal", "xdg-desktop-portal-gtk",
+                    "xdg-desktop-portal-wlr", "xdg-document-portal", "xdg-permission-store", "mpris-proxy",
+                    "filter-chain", "gvfs-*", "wireplumber", "pipewire-pulse", "pipewire",
+                    "pipewire.socket", "pipewire-pulse.socket")
+                run("sudo", "-n", BOOST, "on")
+            else:
+                run("systemctl", "--user", "start", "pipewire.socket", "pipewire-pulse.socket", "wireplumber")
+                run("sudo", "-n", BOOST, "off")
+                try:
+                    os.unlink(BOOST_FLAG)
+                except OSError:
+                    pass
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log("boost", on, e)
+        self.boosted = on
+
     # -- hide / show (esc on an empty box; the launcher script brings us back with SIGUSR1) --
     def ctl_alive(self):
         try:
@@ -2092,14 +2220,15 @@ class App:
             log("state", e)
 
     def hide(self):
-        if self.sudo_req:
+        if self.sudo_req or self.menu_mode:
             return                           # answer the password popup first
         self.save_draft()
         self.kb.close()                      # let go of the keyboard so the launcher gets it
         self.kb = None
         self.hidden = True
+        self.hidden_since = time.time()
         self.want_show = False
-        self.set_state("hidden")             # the launcher script sees this, exits and wakes the launcher
+        self.set_state("hidden")             # the launcher script sees this and exits: launcher's back
 
     def show(self):
         self.hidden = False
@@ -2107,11 +2236,36 @@ class App:
         self.fb.prev = None                  # the launcher drew over us: repaint everything
         self.dirty = True
         self.last_key = time.time()
+        if self.parked:                      # claude was stopped to save RAM: pick the chat back up
+            self.parked = False
+            self.splash("waking claude...")
+            self.start_claude(resume=self.session_id, quiet=True)
+            self.status = "resuming chat..."
+            if self.queue:
+                self.send_user(self.queue.pop(0))
         self.set_state("shown")
+
+    def park(self, why=None):
+        """minimised: stop claude (gives its ~200MB back) and the ram boost; resumes on wake"""
+        if self.claude and self.claude.alive():
+            if self.busy:
+                self.claude.interrupt()
+            self.claude.close()
+        self.parked = True
+        self.busy = False
+        self.turn = None
+        if self.pending or self.ask:
+            self.pending = self.ask = None
+            self.add("info", "  (the question was dropped, ask claude again)")
+        if why:
+            self.add("info", why)
+        self.boost(False)
+        log("parked", why or "idle")
 
     def hidden_tick(self):
         # keep reading claude so its replies (and our chat) stay up to date, but draw nothing
-        fds = [self.claude.fileno()] if self.claude and self.claude.alive() else []
+        live = self.claude and self.claude.alive() and not self.parked
+        fds = [self.claude.fileno()] if live else []
         r, _, _ = select.select(fds + self.sudo_fds() + ([self.web.rfd] if self.web else []), [], [], 0.5)
         self.sudo_poll(r)                    # (says no while hidden, unless a browser is open)
         self.web_tick(r)
@@ -2123,6 +2277,17 @@ class App:
             else:
                 for m in msgs:
                     self.handle(m)
+        if live and not REMOTE:
+            web = self.web and self.web.active()
+            waiting = self.pending or self.ask or self.sudo_req
+            if not web and not self.busy and not waiting and not self.queue:
+                self.park()                  # idle: no reason to keep claude in memory
+            elif mem_free_mb() < HIDDEN_MIN_MB:
+                self.park("── claude was stopped to save memory while hidden. say 'carry on' to continue. ──")
+            elif waiting and not web and time.time() - self.hidden_since > 600:
+                self.park("── claude waited 10 min for you while hidden, so it was stopped. ──")
+        elif self.parked and self.boosted:
+            self.boost(False)
         if self.want_show:
             self.show()
 
@@ -2145,17 +2310,19 @@ class App:
             self.save_draft()
             if self.claude:
                 self.claude.close()
+            self.boost(False)
         finally:
             try:
                 if self.kb:
                     self.kb.close()
             finally:
-                self.fb.close()
+                self.fb.close(blank=not self.hidden)   # hidden: the launcher owns the screen
                 if CAN_HIDE:
                     self.set_state("closed")
 
 
 BOOST = "/usr/local/sbin/clawputer-boost"
+BOOTMODE = "/usr/local/sbin/clawputer-bootmode"
 
 
 def read_file(path):
@@ -2243,6 +2410,8 @@ def main():
         raise
     finally:
         app.close()
+        if app.reboot_after:
+            subprocess.run(["sudo", "-n", BOOTMODE, "exit"], stdin=subprocess.DEVNULL, capture_output=True)
 
 
 if __name__ == "__main__":
