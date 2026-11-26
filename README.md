@@ -18,8 +18,15 @@ and built-in keyboard.
   code blocks in single-line boxes, word wrap, scroll bar
 - **Permission prompts** (`y` / `n` / `a`lways) and Claude's **multiple-choice questions**
 - **Chat history** (F3), opens your last chat on start, delete old ones
-- **Settings** (F2): model, effort, permission mode, font size, tool output lines, Enter =
-  send / new line, double-space full stop
+- **Two chat styles** (F2 > chat style): *plain*, or *bubbles* with your messages in bubbles and
+  Claude's markdown shown properly (bold, headings, bullets, inline code)
+- **Status bar**: context meter (how full Claude's memory of the chat is; `/compact` shrinks
+  it), model, wifi / phone tethering / offline, battery and clock. Shows **offline** instead of
+  ready when Claude can't be reached, and holds your messages until you're back online
+- **Minimise** (Ctrl+H): back to the launcher while Claude keeps working; a **chime** plays when
+  it's done or needs you, and Claude sleeps when idle to give its RAM back
+- **Settings** (F2): model, effort, permission mode, font size, tool output lines, chat style,
+  chime, Enter = send / new line, double-space full stop
 - **Drafts autosave**, messages typed while Claude is busy are queued in order
 - **Easy setup**: installs Claude Code with Anthropic's official installer, then sign in by
   **scanning a QR code with your phone** and pasting the code there (wifi, Tailscale, or

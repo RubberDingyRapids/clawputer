@@ -40,7 +40,7 @@ import clawputer_setup as setup
 
 W, H = 320, 170
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
-FONT_SIZE = int(os.environ.get("CLAUDE_GUI_FONT", "10"))
+BOLD_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
 CLAUDE = setup.claude_path()
 WORKDIR = os.path.expanduser("~/clawputer")
 CONF = setup.CONFIG_DIR
@@ -66,6 +66,8 @@ SETTINGS = [
     ("font", "font size", ["9", "10", "11", "12"], False),
     ("tool_lines", "tool output", ["3", "6", "12", "all"], False),
     ("start", "on start", ["last chat", "new chat"], False),
+    ("style", "chat style", ["plain", "bubbles"], False),
+    ("chime", "chime when minimised", ["on", "off"], False),
     ("dblspace", "double space = '. '", ["on", "off"], False),
     ("enter", "enter key", ["send", "new line"], False),
     ("web", "web ui on open", ["off", "on"], False),
@@ -75,7 +77,7 @@ SETTINGS = [
     ("@signout", "sign out of claude", None, False),
 ]
 DEFAULTS = {"model": "default", "effort": "default", "permissions": "ask", "font": "10", "tool_lines": "3", "start": "last chat",
-            "dblspace": "on", "enter": "send", "web": "off"}
+            "dblspace": "on", "enter": "send", "web": "off", "style": "plain", "chime": "on"}
 
 
 def load_settings():
@@ -119,6 +121,12 @@ ERR = (255, 110, 110)
 BAR = (35, 35, 45)
 ACCENT = (217, 119, 87)
 BOX = (75, 75, 92)
+BUBBLE = (30, 52, 72)        # your messages in the "bubbles" chat style
+BUBBLE_FG = (215, 235, 255)
+BRIGHT = (255, 255, 255)     # **bold** text
+OK = (120, 210, 130)
+MD_TOKEN = re.compile(r"(\*\*[^*\n]+\*\*|`[^`\n]+`)")
+CHIME_FILE = os.path.join(CONF, "chime.wav")
 
 
 def log(*a):
@@ -564,6 +572,11 @@ class App:
         self.boosted = False
         self.boost_wanted = os.environ.get("CLAWPUTER_BOOST") == "1" and not REMOTE
         self.reboot_after = False  # "reboot back to normal?" said yes on quit
+        self.unseen = False        # something happened while minimised
+        self.model = ""            # short model name for the status bar badge
+        self.ctx_used = None       # tokens in claude's context (None = unknown, e.g. just compacted)
+        self.ctx_window = 200000
+        self.ctx_warned = False
         self.sudo_sock = None      # listening socket for sudo password popups
         self.sudo_req = None       # popup on screen: {"conn", "cmd", "pw", "retry"}
         self.sudo_last = (0, 0)    # (sudo pid, time) of the last answer, to spot a wrong password
@@ -616,6 +629,10 @@ class App:
 
     def set_font(self, size):
         self.font = ImageFont.truetype(FONT_PATH, size)
+        try:
+            self.bold = ImageFont.truetype(BOLD_PATH, size)
+        except OSError:
+            self.bold = self.font
         bb = self.font.getbbox("M")
         self.cw = max(1, round(self.font.getlength("M")))
         self.lh = (bb[3] - bb[1]) + 3
@@ -653,22 +670,12 @@ class App:
             self.turn["phase"] = "thinking"          # tool finished, claude's on it again
         if t == "system" and m.get("subtype") == "init":
             self.session_id = m.get("session_id")
-            model = (m.get("model") or "").replace("claude-", "")
-            self.status = ("pc · " if REMOTE else "") + "ready · " + model
-        elif t in ("assistant", "user"):
+            self.model = short_model(m.get("model") or "")
+            if "[1m]" in (m.get("model") or ""):
+                self.ctx_window = 1000000
+            self.status = ("pc · " if REMOTE else "") + "ready"
+        elif t in ("assistant", "user") or (t == "system" and m.get("subtype") == "compact_boundary"):
             self.ingest(m)
-        elif t == "_unused_user":
-            content = m.get("message", {}).get("content", [])
-            if isinstance(content, list):
-                for c in content:
-                    if isinstance(c, dict) and c.get("type") == "tool_result":
-                        txt = result_text(c.get("content")).strip()
-                        lines = txt.splitlines() or [""]
-                        limit = len(lines) if self.cfg["tool_lines"] == "all" else int(self.cfg["tool_lines"])
-                        shown = "\n".join(lines[:limit])
-                        if len(lines) > limit:
-                            shown += "\n… +%d lines" % (len(lines) - limit)
-                        self.add("err" if c.get("is_error") else "result", shown if txt else "(no output)")
         elif t == "control_request":
             r = m.get("request", {})
             if r.get("subtype") == "can_use_tool":
@@ -681,9 +688,17 @@ class App:
                     self.pending = {"id": m["request_id"], "name": name, "input": r.get("input", {})}
                     self.add("ask", "? allow " + short_tool(name, r.get("input")) +
                              "\n  y yes · n no · a always (" + name + ")")
+                if name not in self.always:
+                    self.notify()                    # claude needs you
         elif t == "result":
             self.busy = False
             self.turn = None
+            wins = [v.get("contextWindow") for v in (m.get("modelUsage") or {}).values() if isinstance(v, dict)]
+            wins = [w for w in wins if isinstance(w, int) and w > 0]
+            if wins:
+                self.ctx_window = max(wins)
+            self.notify()                            # claude's done
+            self.ctx_check()
             if self.restart_after_turn:
                 self.restart_after_turn = False
                 self.add("info", "  applying settings...")
@@ -706,7 +721,15 @@ class App:
             return
         msg = m.get("message") or {}
         content = msg.get("content")
+        if t == "system" and m.get("subtype") == "compact_boundary":
+            post = (m.get("compact_metadata") or {}).get("post_tokens")
+            self.ctx_used = post if isinstance(post, int) and post > 0 else None
+            self.ctx_warned = False
+            self.add("info", "── chat compacted: claude keeps a summary ──")
+            return
         if t == "assistant":
+            if not m.get("parent_tool_use_id"):
+                self.note_usage(msg.get("usage"))
             for b in content or []:
                 if b.get("type") == "text" and b.get("text", "").strip():
                     self.add("assistant", b["text"].strip())
@@ -771,6 +794,7 @@ class App:
         self.always.clear()
         self.queue.clear()
         self.ask = None
+        self.ctx_used, self.ctx_warned = None, False
         try:
             if REMOTE:
                 self.status = "loading chat..."
@@ -780,7 +804,7 @@ class App:
                 src = open(chat["path"], encoding="utf-8", errors="replace")
             for line in src:
                 if '"type":"user"' in line or '"type":"assistant"' in line or \
-                        '"type": "user"' in line or '"type": "assistant"' in line:
+                        '"type": "user"' in line or '"type": "assistant"' in line or "compact_boundary" in line:
                     try:
                         self.ingest(json.loads(line), loading=True)
                     except ValueError:
@@ -803,6 +827,7 @@ class App:
         self.always.clear()
         self.queue.clear()
         self.ask = None
+        self.ctx_used, self.ctx_warned = None, False
         self.session_id = None
         self.cwd = WORKDIR
         self.start_claude()
@@ -1169,6 +1194,33 @@ class App:
             return
         self.send_user(text)
 
+    # -- context meter + chime --
+    def note_usage(self, u):
+        if not isinstance(u, dict):
+            return
+        used = sum(u.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens",
+                                           "cache_creation_input_tokens", "output_tokens"))
+        if used > 0:
+            self.ctx_used = used
+            self.dirty = True
+
+    def ctx_frac(self):
+        return None if self.ctx_used is None else min(1.0, self.ctx_used / max(1, self.ctx_window))
+
+    def ctx_check(self):
+        f = self.ctx_frac()
+        if f is not None and f >= 0.8 and not self.ctx_warned:
+            self.ctx_warned = True
+            self.add("info", "  context %d%% full. /compact shrinks it, /new starts fresh." % (f * 100))
+
+    def notify(self):
+        """while minimised: remember there's something new, and chime"""
+        if not self.hidden:
+            return
+        self.unseen = True
+        if self.cfg.get("chime") == "on":
+            play_chime()
+
     def offline(self):
         return bool(self.net) and self.net.online is False
 
@@ -1485,6 +1537,7 @@ class App:
     def close_menu(self):
         self.menu = None
         save_settings(self.cfg)
+        self.lines_cache = None              # chat style may have changed
         changed = [st for st in SETTINGS if st[3] and self.cfg.get(st[0]) != self.menu_before.get(st[0])]
         if self.cfg.get("web") == "on" and self.menu_before.get("web") != "on" and not self.web:
             self.start_web()
@@ -1536,6 +1589,7 @@ class App:
         out = []
         width = self.cols - 2
         inner = self.cols - 4            # text width inside a box
+        bubbles = self.cfg.get("style") == "bubbles"
         hard = lambda s, w: [s[i:i + w] for i in range(0, max(len(s), 1), w)]
         if kind in ("result", "err"):
             out.append((kind, label, "top"))
@@ -1556,6 +1610,11 @@ class App:
                 out.extend(("code", c, "mid") for c in hard(raw, inner))
                 continue
             line = raw
+            if kind == "assistant" and bubbles:
+                out.extend(self.md_lines(raw, width))
+                continue
+            if kind == "user" and bubbles:
+                continue                          # done below, as one bubble
             if kind == "assistant":
                 line = line.replace("**", "").replace("`", "")
                 if line.lstrip().startswith("#"):
@@ -1568,6 +1627,62 @@ class App:
                 out.append((kind, c, None))
         if in_code:                           # unclosed fence
             out.append(("code", "", "bot"))
+        if kind == "user" and bubbles:
+            bw = max(10, int(self.cols * 0.8))
+            rows = []
+            for raw in text.split("\n"):
+                rows.extend(textwrap.wrap(raw, bw, break_long_words=True) or [""])
+            span = max(len(r) for r in rows)
+            out.extend((kind, r, ("bubble", span, i == len(rows) - 1)) for i, r in enumerate(rows))
+        return out
+
+    def md_lines(self, raw, width):
+        """one line of claude's markdown -> wrapped lines of styled runs [(text, style)]
+        styles: None, "b" bold, "code", "h" heading, "dot" list bullet"""
+        head = re.match(r"^\s*#{1,6}\s+(.*)", raw)
+        prefix, body = "", raw
+        if head:
+            runs = [(head.group(1).replace("**", "").replace("`", ""), "h")]
+        else:
+            m = re.match(r"^(\s*)([-*+]|\d+[.)])\s+(.*)", raw)
+            if m:
+                prefix = m.group(1) + ("•" if m.group(2) in "-*+" else m.group(2)) + " "
+                body = m.group(3)
+            runs = []
+            for part in MD_TOKEN.split(body):
+                if not part:
+                    continue
+                if len(part) > 4 and part.startswith("**") and part.endswith("**"):
+                    runs.append((part[2:-2], "b"))
+                elif len(part) > 2 and part[0] == "`" and part[-1] == "`":
+                    runs.append((part[1:-1], "code"))
+                else:
+                    runs.append((part.replace("**", ""), None))
+        chars = "".join(t for t, _ in runs)
+        styles = [st for t, st in runs for _ in t]
+        w = max(8, width - len(prefix))
+        spans, start = [], 0                  # greedy word wrap, keeping char positions
+        while start < len(chars):
+            while start < len(chars) and chars[start] == " " and spans:
+                start += 1
+            end = min(len(chars), start + w)
+            if end < len(chars):
+                cut = chars.rfind(" ", start, end + 1)
+                if cut > start:
+                    end = cut
+            spans.append((start, end))
+            start = end
+        out = []
+        for i, (a, b) in enumerate(spans or [(0, 0)]):
+            line = [(prefix if i == 0 else " " * len(prefix), "dot")] if prefix else []
+            j = a
+            while j < b:
+                k = j
+                while k < b and styles[k] == styles[j]:
+                    k += 1
+                line.append((chars[j:k], styles[j]))
+                j = k
+            out.append(("assistant", line, None))
         return out
 
     def all_lines(self):
@@ -1628,6 +1743,72 @@ class App:
         bottom = H - (len(self.input_lines()) * self.lh + 5)
         return max(1, (bottom - top) // self.lh)
 
+    def draw_status(self, d):
+        """top bar: status on the left; context meter, model, network, battery, clock on the right"""
+        offline = self.offline()
+        if self.busy:
+            left = "|/-\\"[int(time.time() * 4) % 4] + " " + self.busy_label()
+        elif offline:
+            left = "offline: " + ("can't reach your pc" if REMOTE else "no internet")
+        else:
+            left = "claude · " + self.status
+        sm = self.small
+        x = W - 3
+        clock = time.strftime("%H:%M")
+        x -= sm.getlength(clock)
+        d.text((x, 0), clock, font=sm, fill=DIM)
+        cap, chg = battery()
+        if cap is not None:
+            pct = "%d%%" % cap
+            x -= sm.getlength(pct) + 4
+            d.text((x, 0), pct, font=sm, fill=DIM)
+            x -= 17
+            col = OK if cap > 40 or chg else (TOOL if cap > 15 else ERR)
+            d.rectangle((x, 2, x + 12, 8), outline=DIM)
+            d.rectangle((x + 13, 4, x + 14, 6), fill=DIM)
+            if cap:
+                d.rectangle((x + 2, 4, x + 2 + max(1, round(8 * cap / 100)), 6), fill=col)
+            if chg:
+                d.polygon([(x + 7, 0), (x + 3, 6), (x + 6, 6), (x + 5, 10), (x + 10, 4), (x + 7, 4)],
+                          fill=(255, 220, 90), outline=BG)
+        x -= 14
+        self.draw_net_icon(d, x, 1, offline)
+        if self.model and not self.busy:
+            mw = sm.getlength(self.model)
+            x -= mw + 10
+            d.rounded_rectangle((x, 1, x + mw + 6, 10), radius=3, outline=BOX)
+            d.text((x + 3, 0), self.model, font=sm, fill=DIM)
+        f = self.ctx_frac()
+        if f is not None:
+            x -= 24
+            col = ERR if f >= 0.9 else (TOOL if f >= 0.7 else DIM)
+            d.rectangle((x, 3, x + 19, 7), outline=BOX)
+            d.rectangle((x + 1, 4, x + 1 + max(1, round(17 * f)), 6), fill=col)
+            x -= sm.getlength("ctx") + 3
+            d.text((x, 0), "ctx", font=sm, fill=DIM)
+        room = x - 8
+        while left and sm.getlength(left) > room:
+            left = left[:-2] + "…" if len(left) > 2 else ""
+        d.text((3, 0), left, font=sm, fill=ERR if offline else ACCENT)
+        d.line((0, 11, W, 11), fill=BAR)
+
+    @staticmethod
+    def draw_net_icon(d, x, y, offline):
+        kind = net_kind()
+        if kind == "tether" and not offline:          # bluetooth rune: phone tethering
+            c, cx = USER, x + 5
+            d.line((cx, y, cx, y + 9), fill=c)
+            d.line([(cx, y), (cx + 3, y + 2), (cx - 3, y + 7)], fill=c)
+            d.line([(cx, y + 9), (cx + 3, y + 7), (cx - 3, y + 2)], fill=c)
+            return
+        c = ERR if offline or not kind else FG          # wifi fan
+        cx, cy = x + 5, y + 9
+        for r in (9, 6, 3):
+            d.arc((cx - r, cy - r, cx + r, cy + r), 225, 315, fill=c)
+        d.point((cx, cy - 1), fill=c)
+        if offline or not kind:
+            d.line((x, y, x + 10, y + 9), fill=ERR)
+
     def draw_setup(self, img, d):
         title, lines, qr, foot = self.setup.lines()
         d.text((6, 3), title, font=self.font, fill=ACCENT)
@@ -1672,22 +1853,7 @@ class App:
             return self.draw_setup(img, d)
         if self.modescr is not None:
             return self.draw_mode(img, d)
-        # top bar
-        spin = "|/-\\"[int(time.time() * 4) % 4] if self.busy else ""
-        left = (spin + " " + self.busy_label()) if self.busy else ("claude · " + self.status)
-        offline = self.offline()
-        if offline and not self.busy:
-            left = "claude · offline: " + ("can't reach your pc" if REMOTE else "no internet")
-
-        try:
-            cap = open("/sys/class/power_supply/bq27220-0/capacity").read().strip()
-            chg = open("/sys/class/power_supply/bq27220-0/status").read().strip() == "Charging"
-            right = "%s%s%% %s" % ("+" if chg else "", cap, time.strftime("%H:%M"))
-        except OSError:
-            right = time.strftime("%H:%M")
-        d.text((3, 0), left[:40], font=self.small, fill=ERR if offline else ACCENT)
-        d.text((W - 3 - self.small.getlength(right), 0), right, font=self.small, fill=DIM)
-        d.line((0, 11, W, 11), fill=BAR)
+        self.draw_status(d)
         # conversation
         lines = self.all_lines()
         n = self.view_lines()
@@ -1699,7 +1865,33 @@ class App:
                   "ask": ASK, "err": ERR, "info": DIM, "gap": FG, "queued": DIM}
         y = 13
         bx0, bx1 = 3, W - 9                       # box edges (clear of the scroll bar)
+        # bubbles style: paint your message bubbles first, text goes on top
+        start = None
+        for row, (kind, text, pos) in enumerate(view):
+            ry = 13 + row * self.lh
+            if isinstance(pos, tuple):
+                start = ry if start is None else start
+                if pos[2] or row == len(view) - 1:
+                    x0 = bx1 - int(self.font.getlength("M" * pos[1])) - 10
+                    d.rounded_rectangle((x0, start - 1, bx1, ry + self.lh - 1), radius=5, fill=BUBBLE)
+                    start = None
+            else:
+                start = None
         for kind, text, pos in view:
+            if isinstance(pos, tuple):            # a line of your message bubble
+                x0 = bx1 - int(self.font.getlength("M" * pos[1])) - 10
+                d.text((x0 + 5, y), text, font=self.font, fill=BUBBLE_FG)
+                y += self.lh
+                continue
+            if isinstance(text, list):            # claude's markdown, styled
+                x = 3
+                for t, st in text:
+                    f = self.bold if st in ("b", "h") else self.font
+                    col = {"b": BRIGHT, "h": ACCENT, "code": CODE, "dot": ACCENT}.get(st, FG)
+                    d.text((x, y), t, font=f, fill=col)
+                    x += self.font.getlength(t)
+                y += self.lh
+                continue
             if pos:
                 edge = (110, 60, 60) if kind == "err" else BOX
                 mid = y + self.lh // 2 - 1
@@ -2284,6 +2476,9 @@ class App:
         self.hidden = False
         self.kb = Keyboard()
         self.fb.prev = None                  # the launcher drew over us: repaint everything
+        if self.unseen:
+            self.unseen = False
+            self.scroll = 0                  # straight to what happened while you were away
         self.dirty = True
         self.last_key = time.time()
         if self.parked:                      # claude was stopped to save RAM: pick the chat back up
@@ -2374,6 +2569,62 @@ class App:
 
 BOOST = "/usr/local/sbin/clawputer-boost"
 BOOTMODE = "/usr/local/sbin/clawputer-bootmode"
+
+
+def short_model(name):
+    """'claude-opus-5-5[1m]' -> 'opus 5.5'"""
+    name = re.sub(r"\[.*?\]", "", name).replace("claude-", "")
+    parts = [p for p in name.split("-") if p and not (p.isdigit() and len(p) == 8)]   # drop dates
+    if not parts:
+        return ""
+    fam, nums = parts[0], [p for p in parts[1:] if p.isdigit()]
+    return fam + (" " + ".".join(nums) if nums else "")
+
+
+def play_chime():
+    """two soft notes; made once into a little wav, played without blocking"""
+    try:
+        if not os.path.exists(CHIME_FILE):
+            import math
+            import wave
+            rate, frames = 22050, bytearray()
+            for freq, dur in ((880, 0.11), (1320, 0.18)):
+                n = int(rate * dur)
+                for i in range(n):
+                    env = min(1.0, i / 200) * (1 - i / n) ** 2
+                    frames += struct.pack("<h", int(9000 * env * math.sin(2 * math.pi * freq * i / rate)))
+            with wave.open(CHIME_FILE, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(rate)
+                w.writeframes(bytes(frames))
+        for cmd in (["pw-play", CHIME_FILE], ["paplay", CHIME_FILE], ["aplay", "-q", CHIME_FILE]):
+            try:
+                subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+                return
+            except OSError:
+                continue
+    except OSError as e:
+        log("chime", e)
+
+
+def battery():
+    """-> (percent or None, charging?)"""
+    for ps in ["/sys/class/power_supply/bq27220-0"] + glob.glob("/sys/class/power_supply/*"):
+        cap = read_file(ps + "/capacity")
+        if cap.isdigit():
+            return int(cap), read_file(ps + "/status") == "Charging"
+    return None, False
+
+
+def net_kind():
+    """-> 'tether' (phone bluetooth), 'wifi' or None"""
+    if os.path.exists("/sys/class/net/bnep0"):
+        return "tether"
+    if read_file("/sys/class/net/wlan0/operstate") == "up":
+        return "wifi"
+    return None
 
 
 def read_file(path):
