@@ -1,23 +1,30 @@
 """Render store screenshots (320x170 PNG) on the device using the real app code + fonts,
-with example content and no real Claude session. Usage: python3 make_screenshots.py OUTDIR"""
-import os, sys, time
-os.environ["CLAWPUTER_CHECKED"] = "1"
-sys.path.insert(0, "/usr/share/clawputer")
-import clawputer_gui as g
-import clawputer_setup as su
+with example content and no real Claude session. Usage: python3 make_screenshots.py OUTDIR [SRC_DIR]
+Touches nothing real: no framebuffer, keyboard, askpass socket, web ui or network."""
+import os
+import sys
+import time
 
 OUT = sys.argv[1]
+sys.path.insert(0, sys.argv[2] if len(sys.argv) > 2 else "/usr/share/clawputer")
+os.environ.update(CLAWPUTER_CHECKED="1", CLAWPUTER_HIDE="1")
+import clawputer_gui as g  # noqa: E402
+import clawputer_setup as su  # noqa: E402
+
 os.makedirs(OUT, exist_ok=True)
 shots = []
 
 
 class FB:
+    prev = None
     def write(self, img): shots.append(img.copy())
-    def close(self): pass
+    def save_raw(self, path): pass
+    def close(self, blank=True): pass
 
 
 class KB:
     fd = -1
+    def read(self): return []
     def close(self): pass
 
 
@@ -28,17 +35,25 @@ class FakeClaude:
     def answer(self, *a): pass
     def close(self): pass
     def interrupt(self): return True
+    def fileno(self): return -1
 
 
-g.Framebuffer, g.Keyboard, g.ClaudeSession = FB, KB, FakeClaude
+class FakeNet:
+    online, changed = True, False
+
+
+g.Framebuffer, g.Keyboard, g.ClaudeSession, g.NetCheck = FB, KB, FakeClaude, FakeNet
 g.list_chats = lambda: []
 g.install_claude_md = lambda: None
-
-
-def fresh():
-    a = g.App.__new__(g.App)
-    g.App.__init__  # noqa
-    return a
+g.load_settings = lambda: dict(g.DEFAULTS)          # not your real settings
+g.save_settings = lambda cfg: None
+g.App.open_askpass = lambda self: None
+g.App.set_state = lambda self, st: None
+g.battery = lambda: (82, False)
+g.battery_clock = lambda: "82% " + time.strftime("%H:%M")
+g.net_kind = lambda: "wifi"
+g.play_chime = lambda kind="done": None
+g.backlight_set = lambda v: None
 
 
 def app():
@@ -47,13 +62,16 @@ def app():
         a.setup.close()
         a.setup = None
     a.begin_chat()
-    a.entries.clear(); a.lines_cache = None
-    a.status = "ready · opus-5-5"
-    a.cfg["enter"] = "send"
+    a.entries.clear()
+    a.lines_cache = None
+    a.handle({"type": "system", "subtype": "init", "session_id": "s", "model": "claude-opus-5-5"})
+    a.ctx_used, a.ctx_window = 41000, 200000
+    a.cfg.update(enter="send", style="plain")
     return a
 
 
 def save(a, name):
+    a.dirty = True
     a.draw()
     shots[-1].save(os.path.join(OUT, name))
     print("saved", name)
@@ -91,7 +109,8 @@ save(a, "3-question.png")
 a = app()
 a.claude = None
 a.open_mode(first=False)
-a.modescr["boost"] = True; a.modescr["gpu"] = 128
+a.modescr["boost"] = True
+a.modescr["gpu"] = 128
 a.modescr["ram"] = 0
 save(a, "4-start.png")
 
