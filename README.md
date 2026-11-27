@@ -23,6 +23,11 @@ and built-in keyboard.
 - **Status bar**: context meter (how full Claude's memory of the chat is; `/compact` shrinks
   it), model, wifi / phone tethering / offline, battery and clock. Shows **offline** instead of
   ready when Claude can't be reached, and holds your messages until you're back online
+- **Shows what a terminal can't:** edits as a red/green diff before you allow them, Claude's to-do
+  list as a checklist (progress in the status bar), pictures Claude makes or opens, markdown tables
+  as a grid, and colour emoji
+- **Instant start** (the launcher paints the splash before Python loads), **dims when idle** to
+  save battery, optional **sound on prompts**, and **max boost can stay on across reboots**
 - **Minimise** (Ctrl+H): back to the launcher while Claude keeps working; a **chime** plays when
   it's done or needs you, and Claude sleeps when idle to give its RAM back
 - **Settings** (F2): model, effort, permission mode, font size, tool output lines, chat style,

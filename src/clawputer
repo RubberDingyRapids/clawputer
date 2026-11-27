@@ -15,6 +15,9 @@ BOOST=/usr/local/sbin/clawputer-boost
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
 echo $$ > "$CONF/gui.ctl"  # the chat on screen checks we're still here
+FB="${APPLAUNCH_LINUX_FBDEV_DEVICE:-/dev/fb_lcd}"
+# the GUI saves its "starting" screen; painting it straight away beats a dead screen while Python loads
+splash(){ [ -s "$CONF/splash.raw" ] && cat "$CONF/splash.raw" > "$FB" 2>/dev/null; }
 
 boost_ok(){ [ -x "$BOOST" ] && sudo -n -l "$BOOST" on >/dev/null 2>&1; }
 chat_running(){ systemctl --user is-active --quiet "$UNIT"; }
@@ -50,6 +53,7 @@ start_chat(){
   # ExecStopPost: however the chat ends (quit, crash, killed), the ram boost gets put back.
   mkdir -p "$HOME/clawputer"
   rm -f "$STATE"
+  splash
   systemd-run --user --quiet --collect --unit="$UNIT" --working-directory="$HOME/clawputer" \
     -p OOMScoreAdjust=500 -p KillMode=mixed -p TimeoutStopSec=20 \
     -p StandardError="append:$CONF/gui.log" -p ExecStopPost="$SHARE/clawputer-cleanup" \
@@ -84,6 +88,7 @@ fi
 systemctl --user reset-failed "$UNIT" >/dev/null 2>&1
 
 # ---- mode screen (the GUI does the install / sign-in / ram boost setup itself) ----
+splash
 rm -f "$CONF/choice"
 PYTHONPATH="$SHARE" python3 "$GUI" --menu < /dev/null >/dev/null 2>>"$CONF/gui.log"
 CHOICE=$(cat "$CONF/choice" 2>/dev/null || echo quit)

@@ -41,6 +41,10 @@ import clawputer_setup as setup
 W, H = 320, 170
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 BOLD_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
+EMOJI_FONT = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"     # fonts-noto-color-emoji
+EMOJI_PAD = "\ue000"      # placeholder after each emoji: emoji are 2 cells wide in the monospace grid
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
+KEEP_FLAG = "/etc/clawputer/keep-max-boost"   # max boost survives reboots (clawputer-bootmode keep on)
 CLAUDE = setup.claude_path()
 WORKDIR = os.path.expanduser("~/clawputer")
 CONF = setup.CONFIG_DIR
@@ -68,6 +72,9 @@ SETTINGS = [
     ("start", "on start", ["last chat", "new chat"], False),
     ("style", "chat style", ["plain", "bubbles"], False),
     ("chime", "chime when minimised", ["on", "off"], False),
+    ("prompt_sound", "sound on prompts", ["on", "off"], False),
+    ("dim", "dim when idle", ["1 min", "5 min", "off"], False),
+    ("maxboost", "max boost after reboot", ["restore", "keep"], False),
     ("dblspace", "double space = '. '", ["on", "off"], False),
     ("enter", "enter key", ["send", "new line"], False),
     ("web", "web ui on open", ["off", "on"], False),
@@ -87,6 +94,9 @@ SETTING_HELP = {
     "start": "what opens when you start a chat.",
     "style": "plain = like a terminal. bubbles = your messages in bubbles + nicer markdown.",
     "chime": "a sound when claude finishes or needs you while minimised.",
+    "prompt_sound": "a sound when claude asks permission or a question, while you're in the chat.",
+    "dim": "dims the screen when you don't press anything for a while (saves battery). any key wakes it.",
+    "maxboost": "restore = a reboot gives the gpu memory back. keep = max boost stays on across reboots.",
     "dblspace": "two spaces type a full stop and a space, like a phone keyboard.",
     "enter": "what enter does. the other way to send is ctrl+enter.",
     "web": "start the web ui (use the chat from a phone / pc browser) every time.",
@@ -109,7 +119,8 @@ CHOICE_HELP = {
     ("effort", "max"): "⚠ thinks the longest: slow and heavy on usage limits.",
 }
 DEFAULTS = {"model": "default", "effort": "default", "permissions": "ask", "font": "10", "tool_lines": "3", "start": "last chat",
-            "dblspace": "on", "enter": "send", "web": "off", "style": "plain", "chime": "on"}
+            "dblspace": "on", "enter": "send", "web": "off", "style": "plain", "chime": "on",
+            "prompt_sound": "on", "dim": "1 min", "maxboost": "restore"}
 
 
 def load_settings():
@@ -205,6 +216,18 @@ class Framebuffer:
             o = (y + self.yoff) * self.stride + (l + self.xoff) * self.bpp // 8
             self.mem[o:o + rowbytes] = px[row * rowbytes:(row + 1) * rowbytes]
         self.prev = img.copy()
+
+    def save_raw(self, path):
+        """the visible frame exactly as the panel wants it, for `cat file > /dev/fb_lcd`"""
+        try:
+            n = (self.yoff + self.height) * self.stride
+            data = bytes(self.mem[:n])
+            if not os.path.exists(path) or os.path.getsize(path) != len(data):
+                with open(path + ".tmp", "wb") as f:
+                    f.write(data)
+                os.replace(path + ".tmp", path)
+        except (OSError, ValueError) as e:
+            log("splash cache", e)
 
     def close(self, blank=True):
         try:
@@ -589,7 +612,7 @@ class App:
         self.last_space = 0
         self.ask = None            # AskUserQuestion in progress
         self.draft_saved = ""
-        self.last_key = 0
+        self.last_key = time.time()
         self.session_id = None
         self.dirty = True
         self.last_clock = 0
@@ -610,6 +633,15 @@ class App:
         self.unseen = False        # something happened while minimised
         self.prompt_t = 0          # when the current permission prompt / question appeared
         self.wrap_memo = {}        # (message, layout settings) -> wrapped lines
+        self.todos = []            # claude's to-do list (TodoWrite)
+        self.skip_results = set()  # tool_use ids whose result isn't worth showing (TodoWrite)
+        self.image_after = {}      # tool_use id -> image path to preview once its result arrives
+        self.glyph_ok = {}         # char -> the main font has it
+        self.emoji_cache = {}      # (char, size) -> RGBA image
+        self.thumbs = {}           # (path, mtime, width) -> thumbnail
+        self.canvas = None         # the image being drawn (for pasting emoji / pictures)
+        self.dimmed = False
+        self.bright = backlight_get() or 60
         self.seen_len = 0          # chat length at the last draw (keeps the view still while scrolled up)
         self.new_below = False     # new lines arrived below while you're scrolled up
         self.interrupted = False   # you stopped claude: don't send the next queued message
@@ -657,6 +689,8 @@ class App:
         d.line((0, 16, W, 16), fill=BAR)
         d.text((6, 24), text, font=self.small, fill=FG)
         self.fb.write(img)
+        if text == "starting clawputer...":
+            self.fb.save_raw(SPLASH_FILE)        # the launcher script shows this instantly next time
 
     def begin_chat(self):
         install_claude_md()
@@ -735,6 +769,9 @@ class App:
                              "\n  y yes · n no · a always (" + name + ")")
                 if name not in self.always:
                     self.notify()                    # claude needs you
+                    self.wake_screen()
+                    if not self.hidden and self.cfg.get("prompt_sound") == "on":
+                        play_chime("prompt")
         elif t == "result":
             self.busy = False
             self.turn = None
@@ -782,7 +819,7 @@ class App:
                 if b.get("type") == "text" and b.get("text", "").strip():
                     self.add("assistant", b["text"].strip())
                 elif b.get("type") == "tool_use":
-                    self.add("tool", "▸ " + short_tool(b.get("name", "?"), b.get("input")))
+                    self.tool_use(b, loading)
         elif t == "user":
             if isinstance(content, str):
                 if loading and content.strip() and not content.lstrip().startswith("<"):
@@ -791,7 +828,13 @@ class App:
             for c in content or []:
                 if not isinstance(c, dict):
                     continue
+                if c.get("type") == "tool_result" and c.get("tool_use_id") in self.skip_results:
+                    continue                         # (e.g. "todos updated")
                 if c.get("type") == "tool_result":
+                    img = self.image_after.pop(c.get("tool_use_id"), None)
+                    if img and not c.get("is_error"):
+                        self.add("image", img)
+                        continue
                     # keep the whole output (the web ui unfolds it); the cardputer trims it when
                     # drawing. capped so one huge file can't eat the RAM
                     txt = result_text(c.get("content")).strip()
@@ -802,6 +845,31 @@ class App:
                     self.add("err" if c.get("is_error") else "result", txt[:RESULT_MAX_CHARS] if txt else "(no output)")
                 elif loading and c.get("type") == "text" and not c.get("text", "").lstrip().startswith("<"):
                     self.add("user", c.get("text", "").strip())
+
+    def tool_use(self, b, loading=False):
+        name, inp, tid = b.get("name", "?"), b.get("input") or {}, b.get("id")
+        if name == "TodoWrite" and isinstance(inp.get("todos"), list):
+            self.todos = inp["todos"]
+            self.skip_results.add(tid)
+            self.add("todo", todo_text(self.todos))
+            return
+        self.add("tool", "▸ " + short_tool(name, inp))
+        if name in ("Edit", "MultiEdit", "Write"):
+            diff = edit_diff(name, inp, None if REMOTE else self.cwd)
+            if diff:
+                self.add("diff", diff)
+        if REMOTE:
+            return
+        path = None
+        if name == "Read" and str(inp.get("file_path", "")).lower().endswith(IMAGE_EXT):
+            path = inp["file_path"]
+        elif name == "Bash":                 # a command that makes a picture: show it afterwards
+            m = re.findall(r"[\w./~-]+\.(?:png|jpe?g|gif|bmp|webp)\b", str(inp.get("command", "")), re.I)
+            if m:
+                path = m[-1]
+        if path and tid:
+            p = os.path.expanduser(path)
+            self.image_after[tid] = p if os.path.isabs(p) else os.path.join(self.cwd or WORKDIR, p)
 
     # -- drafts (half-typed messages survive quitting / switching chats) --
     def draft_key(self):
@@ -844,6 +912,7 @@ class App:
         self.queue.clear()
         self.ask = None
         self.ctx_used, self.ctx_warned = None, False
+        self.todos = []
         try:
             if REMOTE:
                 self.status = "loading chat..."
@@ -877,6 +946,7 @@ class App:
         self.queue.clear()
         self.ask = None
         self.ctx_used, self.ctx_warned = None, False
+        self.todos = []
         self.session_id = None
         self.cwd = WORKDIR
         self.start_claude()
@@ -1145,6 +1215,7 @@ class App:
         self.ask = {"id": request_id, "input": tool_input, "qs": qs, "qi": 0, "sel": 0,
                     "picked": set(), "answers": {}, "typing": False, "draft": self.input}
         self.prompt_t = time.time()
+        self.wake_screen()
         self.dirty = True
 
     def ask_options(self):
@@ -1675,6 +1746,8 @@ class App:
         save_settings(self.cfg)
         self.lines_cache = None              # chat style may have changed
         changed = [st for st in SETTINGS if st[3] and self.cfg.get(st[0]) != self.menu_before.get(st[0])]
+        if self.cfg.get("maxboost") != self.menu_before.get("maxboost"):
+            self.set_keep_boost(self.cfg["maxboost"] == "keep")
         if self.cfg.get("web") == "on" and self.menu_before.get("web") != "on" and not self.web:
             self.start_web()
         if changed:
@@ -1745,7 +1818,18 @@ class App:
 
     def _wrap(self, kind, text, label=""):
         """-> list of (kind, text, boxpos); boxpos None, or top (border + label) / mid / bot"""
+        if kind == "image":
+            return self.image_rows(text)
+        text = self.pad_emoji(text)
+        label = self.pad_emoji(label)
         out = []
+        if kind in ("diff", "todo"):
+            hard = lambda s, w: [s[i:i + w] for i in range(0, max(len(s), 1), w)]
+            out.append((kind, "changes" if kind == "diff" else todo_label(self.todos, text), "top"))
+            for raw in text.split("\n"):
+                out.extend((kind, c, "mid") for c in hard(raw, self.cols - 4))
+            out.append((kind, "", "bot"))
+            return out
         width = self.cols - 2
         inner = self.cols - 4            # text width inside a box
         bubbles = self.cfg.get("style") == "bubbles"
@@ -1761,7 +1845,14 @@ class App:
             out.append((kind, "", "bot"))
             return out
         in_code = False
+        table = []
         for raw in text.split("\n"):
+            if kind == "assistant" and not in_code and raw.strip().startswith("|"):
+                table.append(raw)                 # markdown table: collect, draw as a grid
+                continue
+            if table:
+                out.extend(table_lines(table, width))
+                table = []
             if kind == "assistant" and raw.strip().startswith("```"):
                 if in_code:
                     out.append(("code", "", "bot"))
@@ -1788,6 +1879,8 @@ class App:
                 if kind == "user":
                     c = ("› " if i == 0 else "  ") + c
                 out.append((kind, c, None))
+        if table:
+            out.extend(table_lines(table, width))
         if in_code:                           # unclosed fence
             out.append(("code", "", "bot"))
         if kind == "user" and bubbles:
@@ -1876,7 +1969,7 @@ class App:
         """word-wrap the message box (keeps spaces, honours new lines), cursor at the end"""
         width = self.cols - 2
         rows, cur = [], ""
-        for para_i, para in enumerate(self.input.split("\n")):
+        for para_i, para in enumerate(self.pad_emoji(self.input).split("\n")):
             if para_i:
                 rows.append(cur)
                 cur = ""
@@ -1905,6 +1998,126 @@ class App:
         top = 12
         bottom = H - (len(self.input_lines()) * self.lh + 5)
         return max(1, (bottom - top) // self.lh)
+
+    # -- emoji: the monospace font has none; draw them from Noto Color Emoji, 2 cells wide --
+    def has_glyph(self, ch):
+        ok = self.glyph_ok.get(ch)
+        if ok is None:
+            notdef = bytes(self.font.getmask("\U0010FFFF"))
+            ok = self.glyph_ok[ch] = bytes(self.font.getmask(ch)) != notdef
+        return ok
+
+    def is_emoji(self, ch):
+        o = ord(ch)
+        return (o >= 0x1F000 or 0x2600 <= o <= 0x27BF or 0x2B00 <= o <= 0x2BFF) and not self.has_glyph(ch)
+
+    def pad_emoji(self, s):
+        if not isinstance(s, str) or s.isascii():
+            return s
+        s = s.replace("\ufe0f", "").replace("\u200d", "")
+        return "".join(ch + EMOJI_PAD if self.is_emoji(ch) else ch for ch in s)
+
+    def emoji_image(self, ch, size):
+        key = (ch, size)
+        if key not in self.emoji_cache:
+            im = None
+            if os.path.exists(EMOJI_FONT):
+                try:
+                    f = ImageFont.truetype(EMOJI_FONT, 109)      # bitmap font: only size 109 exists
+                    big = Image.new("RGBA", (140, 130), (0, 0, 0, 0))
+                    ImageDraw.Draw(big).text((0, 0), ch, font=f, embedded_color=True)
+                    box = big.getbbox()
+                    if box:
+                        im = big.crop(box).resize((size, size), Image.LANCZOS)
+                except (OSError, ValueError) as e:
+                    log("emoji", e)
+            self.emoji_cache[key] = im
+        return self.emoji_cache[key]
+
+    def text(self, d, xy, s, font, fill):
+        """d.text that also draws emoji (and skips their padding). -> x after the text"""
+        x, y = xy
+        if s.isascii() or EMOJI_PAD not in s:
+            d.text((x, y), s, font=font, fill=fill)
+            return x + font.getlength(s)
+        cell = self.font.getlength("M")
+        run = ""
+        for ch in s:
+            if ch == EMOJI_PAD:
+                continue
+            if self.is_emoji(ch):
+                if run:
+                    d.text((x, y), run, font=font, fill=fill)
+                    x += font.getlength(run)
+                    run = ""
+                size = max(8, min(self.lh - 2, int(cell * 2) - 1))
+                im = self.emoji_image(ch, size)
+                if im is not None and self.canvas is not None:
+                    self.canvas.paste(im, (int(x + (cell * 2 - size) / 2), y + 1), im)
+                else:
+                    d.text((x, y), "▫", font=font, fill=DIM)
+                x += cell * 2
+            else:
+                run += ch
+        if run:
+            d.text((x, y), run, font=font, fill=fill)
+            x += font.getlength(run)
+        return x
+
+    # -- pictures claude made or opened --
+    def thumb(self, path):
+        try:
+            mt = os.path.getmtime(path)
+        except OSError:
+            return None
+        key = (path, mt, self.cols)
+        if key not in self.thumbs:
+            try:
+                im = Image.open(path)
+                im.draft("RGB", (W, 6 * self.lh))
+                im = im.convert("RGB")
+                im.thumbnail((W - 24, 6 * self.lh))
+                if len(self.thumbs) > 20:
+                    self.thumbs.clear()
+                self.thumbs[key] = im
+            except Exception as e:                  # anything PIL can't read
+                log("image", path, e)
+                self.thumbs[key] = None
+        return self.thumbs[key]
+
+    def image_rows(self, path):
+        im = self.thumb(path)
+        name = os.path.basename(path)
+        if im is None:
+            return [("info", "  (picture %s isn't there / can't be shown)" % name[:40], None)]
+        rows = -(-(im.size[1] + 2) // self.lh)
+        return [("info", "  🖼" + EMOJI_PAD + " " + name[:44], None)] + \
+            [("image", path, ("img", i, rows)) for i in range(rows)]
+
+    def paste_image(self, canvas, path, y0):
+        im = self.thumb(path)
+        if im is None:
+            return
+        top, bottom = 13, H - (len(self.input_lines()) * self.lh + 5)
+        crop_top = max(0, top - y0)
+        visible = im.crop((0, crop_top, im.size[0], max(crop_top, min(im.size[1], bottom - y0))))
+        if visible.size[1] > 0:
+            canvas.paste(visible, (12, y0 + crop_top + 2))
+
+    # -- dim the backlight when idle --
+    def dim_tick(self):
+        mins = {"1 min": 60, "5 min": 300}.get(self.cfg.get("dim"))
+        if mins and not self.dimmed and not self.pending and time.time() - self.last_key > mins:
+            cur = backlight_get()
+            if cur:
+                self.bright = cur
+            backlight_set(max(3, self.bright // 8))
+            self.dimmed = True
+
+    def wake_screen(self):
+        if self.dimmed:
+            backlight_set(self.bright)
+            self.dimmed = False
 
     def draw_status(self, d):
         """top bar: status on the left; context meter, model, network, battery, clock on the right"""
@@ -1943,6 +2156,11 @@ class App:
             x -= mw + 10
             d.rounded_rectangle((x, 1, x + mw + 6, 10), radius=3, outline=BOX)
             d.text((x + 3, 0), self.model, font=sm, fill=DIM)
+        if self.todos and any(t.get("status") != "completed" for t in self.todos):
+            done = sum(t.get("status") == "completed" for t in self.todos)
+            tl = "✓%d/%d" % (done, len(self.todos))
+            x -= sm.getlength(tl) + 6
+            d.text((x, 0), tl, font=sm, fill=OK)
         f = self.ctx_frac()
         if f is not None:
             x -= 24
@@ -2018,6 +2236,7 @@ class App:
             return self.draw_setup(img, d)
         if self.modescr is not None:
             return self.draw_mode(img, d)
+        self.canvas = img
         self.draw_status(d)
         # conversation
         lines = self.all_lines()
@@ -2040,7 +2259,7 @@ class App:
         start = None
         for row, (kind, text, pos) in enumerate(view):
             ry = 13 + row * self.lh
-            if isinstance(pos, tuple):
+            if isinstance(pos, tuple) and pos[0] == "bubble":
                 start = ry if start is None else start
                 if pos[2] or row == len(view) - 1:
                     x0 = bx1 - int(self.font.getlength("M" * pos[1])) - 10
@@ -2048,10 +2267,17 @@ class App:
                     start = None
             else:
                 start = None
+        drawn_imgs = set()
         for kind, text, pos in view:
+            if isinstance(pos, tuple) and pos[0] == "img":    # a picture spanning several rows
+                if text not in drawn_imgs:
+                    drawn_imgs.add(text)
+                    self.paste_image(img, text, y - pos[1] * self.lh)
+                y += self.lh
+                continue
             if isinstance(pos, tuple):            # a line of your message bubble
                 x0 = bx1 - int(self.font.getlength("M" * pos[1])) - 10
-                d.text((x0 + 5, y), text, font=self.font, fill=BUBBLE_FG)
+                self.text(d, (x0 + 5, y), text, self.font, BUBBLE_FG)
                 y += self.lh
                 continue
             if isinstance(text, list):            # claude's markdown, styled
@@ -2059,8 +2285,12 @@ class App:
                 for t, st in text:
                     f = self.bold if st in ("b", "h") else self.font
                     col = {"b": BRIGHT, "h": ACCENT, "code": CODE, "dot": ACCENT}.get(st, FG)
-                    d.text((x, y), t, font=f, fill=col)
-                    x += self.font.getlength(t)
+                    x = self.text(d, (x, y), t, f, col)
+                y += self.lh
+                continue
+            if kind in ("table", "tableh"):
+                col = ACCENT if kind == "tableh" else (DIM if set(text) <= set("─┼ ") else FG)
+                self.text(d, (3, y), text, self.bold if kind == "tableh" else self.font, col)
                 y += self.lh
                 continue
             if pos:
@@ -2075,7 +2305,8 @@ class App:
                         lab = " " + text[:self.cols - 6] + " "
                         lw = self.font.getlength(lab)
                         d.rectangle((bx0 + 6, y, bx0 + 6 + lw, y + self.lh - 3), fill=BG)
-                        d.text((bx0 + 6, y), lab, font=self.font, fill=TOOL if kind != "code" else DIM)
+                        self.text(d, (bx0 + 6, y), lab, self.font,
+                                  DIM if kind == "code" else (ACCENT if kind in ("diff", "todo") else TOOL))
                 elif pos == "bot":
                     d.line((bx0, cell0, bx0, mid), fill=edge)
                     d.line((bx1, cell0, bx1, mid), fill=edge)
@@ -2083,9 +2314,14 @@ class App:
                 else:
                     d.line((bx0, cell0, bx0, cell1), fill=edge)
                     d.line((bx1, cell0, bx1, cell1), fill=edge)
-                    d.text((bx0 + 5, y), text, font=self.font, fill=colors.get(kind, FG))
+                    col = colors.get(kind, FG)
+                    if kind == "diff":
+                        col = OK if text[:1] == "+" else (ERR if text[:1] == "-" else (DIM if text[:2] == "@@" else RESULT))
+                    elif kind == "todo":
+                        col = DIM if text[:1] == "✓" else (ACCENT if text[:1] == "▶" else FG)
+                    self.text(d, (bx0 + 5, y), text, self.font, col)
             else:
-                d.text((3, y), text, font=self.font, fill=colors.get(kind, FG))
+                self.text(d, (3, y), text, self.font, colors.get(kind, FG))
             y += self.lh
         # scroll bar
         track_top, track_bot = 13, H - (len(self.input_lines()) * self.lh + 7)
@@ -2105,7 +2341,7 @@ class App:
             prefix = "› " if i == 0 else "  "
             if self.pending:
                 r, prefix = "y / n / a ?" + ("   j = jump to bottom" if self.scroll else ""), "› "
-            d.text((3, top + 1 + i * self.lh), prefix + r, font=self.font, fill=col)
+            self.text(d, (3, top + 1 + i * self.lh), prefix + r, self.font, col)
             if self.pending:
                 break
             if not self.input and self.ask and self.ask["typing"]:
@@ -2195,9 +2431,14 @@ class App:
             self.sudo_poll(r)
             self.web_tick(r)
             if self.kb.fd in r:
-                for k in self.kb.read():
+                keys = self.kb.read()
+                if self.dimmed and keys:
+                    self.wake_screen()               # the key that wakes the screen does nothing else
+                    keys = []
+                for k in keys:
                     self.key(k)
                 self.last_key = time.time()
+            self.dim_tick()
             # autosave the half-typed message a second after you stop typing
             if self.input != self.draft_saved and time.time() - self.last_key > 1.0:
                 self.save_draft()
@@ -2618,10 +2859,23 @@ class App:
                                              "pick 'just run it', or try again."], hint="any key", err=True)
         return False
 
+    def set_keep_boost(self, keep):
+        try:
+            p = subprocess.run(["sudo", "-n", BOOTMODE, "keep", "on" if keep else "off"],
+                               stdin=subprocess.DEVNULL, capture_output=True, timeout=20)
+            ok = p.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            ok = False
+        if ok:
+            self.add("info", "  max boost " + ("stays on across reboots." if keep else "goes back to normal on the next reboot."))
+        else:
+            self.add("info", "  couldn't change it yet: pick a ram boost option on the start screen once "
+                             "(it updates the boost helpers, asks your password).")
+
     def ask_reboot_back(self):
         """quitting after a max-boost restart: offer to reboot back to normal"""
         self.reboot_after = False
-        if REMOTE or not self.kb or gpu_mb() > 16 or not boost_state()[0]:
+        if REMOTE or not self.kb or gpu_mb() > 16 or not boost_state()[0] or os.path.exists(KEEP_FLAG):
             return
         k = self.dialog("reboot back to normal?",
                         ["gives the gpu memory back and turns the camera on again."],
@@ -2674,6 +2928,7 @@ class App:
         if self.sudo_req or self.menu_mode:
             return                           # answer the password popup first
         self.save_draft()
+        self.wake_screen()
         self.kb.close()                      # let go of the keyboard so the launcher gets it
         self.kb = None
         self.hidden = True
@@ -2767,6 +3022,7 @@ class App:
             if self.claude:
                 self.claude.close()
             self.boost(False)
+            self.wake_screen()
         finally:
             try:
                 if self.kb:
@@ -2791,24 +3047,27 @@ def short_model(name):
     return fam + (" " + ".".join(nums) if nums else "")
 
 
-def play_chime():
-    """two soft notes; made once into a little wav, played without blocking"""
+def play_chime(kind="done"):
+    """a soft sound, made once into a little wav, played without blocking.
+    done = two notes up (claude finished), prompt = a quick double tap (claude needs you)"""
+    path = CHIME_FILE if kind == "done" else os.path.join(CONF, "prompt.wav")
+    notes = ((880, 0.11), (1320, 0.18)) if kind == "done" else ((1175, 0.07), (0, 0.05), (1175, 0.09))
     try:
-        if not os.path.exists(CHIME_FILE):
+        if not os.path.exists(path):
             import math
             import wave
             rate, frames = 22050, bytearray()
-            for freq, dur in ((880, 0.11), (1320, 0.18)):
+            for freq, dur in notes:
                 n = int(rate * dur)
                 for i in range(n):
                     env = min(1.0, i / 200) * (1 - i / n) ** 2
                     frames += struct.pack("<h", int(9000 * env * math.sin(2 * math.pi * freq * i / rate)))
-            with wave.open(CHIME_FILE, "wb") as w:
+            with wave.open(path, "wb") as w:
                 w.setnchannels(1)
                 w.setsampwidth(2)
                 w.setframerate(rate)
                 w.writeframes(bytes(frames))
-        for cmd in (["pw-play", CHIME_FILE], ["paplay", CHIME_FILE], ["aplay", "-q", CHIME_FILE]):
+        for cmd in (["pw-play", path], ["paplay", path], ["aplay", "-q", path]):
             try:
                 subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, start_new_session=True)
@@ -2817,6 +3076,99 @@ def play_chime():
                 continue
     except OSError as e:
         log("chime", e)
+
+
+SPLASH_FILE = os.path.join(CONF, "splash.raw")
+
+
+def backlight_path():
+    return (glob.glob("/sys/class/backlight/*/brightness") or [None])[0]
+
+
+def backlight_get():
+    try:
+        return int(read_file(backlight_path()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def backlight_set(v):
+    p = backlight_path()
+    if p:
+        try:
+            with open(p, "w") as f:
+                f.write(str(int(v)))
+        except OSError as e:
+            log("backlight", e)
+
+
+def todo_text(todos):
+    mark = {"completed": "✓", "in_progress": "▶"}
+    return "\n".join("%s %s" % (mark.get(t.get("status"), "☐"),
+                                 t.get("activeForm") if t.get("status") == "in_progress" and t.get("activeForm")
+                                 else t.get("content", "")) for t in todos)
+
+
+def todo_label(todos, text):
+    n = text.count("\n") + 1
+    done = text.count("✓ ")
+    return "to-do %d/%d" % (done, n)
+
+
+def edit_diff(name, inp, cwd, limit=14):
+    """old -> new text of an Edit / MultiEdit / Write as a short unified diff"""
+    import difflib
+    pairs = []
+    if name == "Edit":
+        pairs = [(inp.get("old_string", ""), inp.get("new_string", ""))]
+    elif name == "MultiEdit":
+        pairs = [(e.get("old_string", ""), e.get("new_string", "")) for e in inp.get("edits", []) if isinstance(e, dict)]
+    elif name == "Write":
+        old = ""
+        path = inp.get("file_path", "")
+        if cwd is not None and path:
+            try:
+                with open(path if os.path.isabs(path) else os.path.join(cwd, path), errors="replace") as f:
+                    old = f.read(200000)
+            except OSError:
+                old = ""
+        pairs = [(old, inp.get("content", ""))]
+    out = []
+    for a, b in pairs:
+        if not isinstance(a, str) or not isinstance(b, str):
+            continue
+        for ln in difflib.unified_diff(a.splitlines(), b.splitlines(), lineterm="", n=1):
+            if ln.startswith(("---", "+++")):
+                continue
+            out.append(ln)
+    if not out:
+        return ""
+    more = len(out) - limit
+    return "\n".join(out[:limit] + (["… +%d more lines" % more] if more > 0 else []))
+
+
+def table_lines(rows, width):
+    """markdown table rows -> grid lines: [("tableh"/"table", text, None)]"""
+    cells = []
+    for r in rows:
+        c = [x.strip().replace("**", "").replace("`", "") for x in r.strip().strip("|").split("|")]
+        if all(re.fullmatch(r":?-{2,}:?", x) for x in c if x):
+            continue                                     # the |---|---| line
+        cells.append(c)
+    if not cells:
+        return []
+    n = max(len(c) for c in cells)
+    cells = [c + [""] * (n - len(c)) for c in cells]
+    w = [max(len(c[i]) for c in cells) for i in range(n)]
+    while sum(w) + 3 * (n - 1) > width and max(w) > 3:
+        w[w.index(max(w))] -= 1
+    fit = lambda s, k: s if len(s) <= k else s[:max(1, k - 1)] + "…"
+    out = []
+    for i, c in enumerate(cells):
+        out.append(("tableh" if i == 0 else "table", " │ ".join(fit(c[j], w[j]).ljust(w[j]) for j in range(n)), None))
+        if i == 0 and len(cells) > 1:
+            out.append(("table", "─┼─".join("─" * k for k in w), None))
+    return out
 
 
 def claude_email():

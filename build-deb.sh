@@ -36,7 +36,7 @@ Maintainer: RubberDingyRapids <RubberDingyRapids@users.noreply.github.com>
 Section: APPLaunch
 Priority: optional
 Homepage: https://github.com/RubberDingyRapids/clawputer
-Depends: python3, python3-pil, python3-numpy, python3-qrcode, curl, openssh-client, fonts-dejavu-core
+Depends: python3, python3-pil, python3-numpy, python3-qrcode, curl, openssh-client, fonts-dejavu-core, fonts-noto-color-emoji
 Description: Pocket chat app for Claude Code on CardputerZero (unofficial)
  A compact chat GUI for Anthropic's Claude Code made for the CardputerZero's
  320x170 screen and keyboard: code boxes, chat history, settings, permission

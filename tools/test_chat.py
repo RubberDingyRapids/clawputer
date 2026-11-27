@@ -20,6 +20,7 @@ class FB:
     prev = None
     def write(self, img): shots.append(img.copy())
     def close(self, blank=True): pass
+    def save_raw(self, path): pass
 
 
 class KB:
@@ -51,7 +52,7 @@ g.Framebuffer, g.Keyboard, g.ClaudeSession = FB, KB, FakeClaude
 g.NetCheck = FakeNet
 g.list_chats = lambda: []
 g.install_claude_md = lambda: None
-g.play_chime = lambda: chimes.append(time.time())
+g.play_chime = lambda kind="done": chimes.append(time.time()) if kind == "done" else None
 g.save_settings = lambda cfg: None
 g.load_settings = lambda: dict(g.DEFAULTS)          # never your real settings (e.g. web ui on)
 g.App.open_askpass = lambda self: None
@@ -343,6 +344,67 @@ except SystemExit:
     quit_ok = True
 check(quit_ok and open(os.path.join(tmp, "switch")).read() == "pc", "switch -> writes 'pc' for the launcher and quits")
 g.CONF = real_conf
+
+
+# ---- 0.7.0 ----
+if os.environ.get("CZ_EMOJI_FONT"):
+    g.EMOJI_FONT = os.environ["CZ_EMOJI_FONT"]
+a.entries.clear(); a.queue.clear(); a.input = ""; a.busy = False; a.pending = None; a.ask = None; a.scroll = 0
+a.cfg["style"] = "plain"; a.lines_cache = None; a.wrap_memo.clear()
+# to-do list
+a.handle({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "TodoWrite", "input": {
+    "todos": [{"content": "scan the i2c bus", "status": "completed", "activeForm": "scanning"},
+              {"content": "check the lora cap", "status": "in_progress", "activeForm": "checking the lora cap"},
+              {"content": "write it up", "status": "pending", "activeForm": "writing"}]}}]}})
+a.handle({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "Todos have been modified successfully"}]}})
+kinds = [k for k, _ in a.entries]
+check(kinds == ["todo"], "TodoWrite becomes a checklist (its 'modified' result hidden): %r" % kinds)
+# tables + emoji
+a.handle({"type": "assistant", "message": {"content": [{"type": "text", "text":
+    "Done 🎉 here's the bus:\n\n| addr | device | ok |\n|---|---|---|\n| 0x43 | LoRa cap IO expander | ✅ |\n| 0x55 | battery gauge | ✅ |\n\nall good 👍"}]}})
+rows = [(k, t) for k, t, p in a.all_lines()]
+check(any(k == "tableh" and "addr" in t for k, t in rows) and any(k == "table" and "0x55" in t for k, t in rows),
+      "markdown table drawn as a grid")
+check(any(g.EMOJI_PAD in (t if isinstance(t, str) else "") for k, t in rows), "emoji get a 2-cell placeholder")
+save(a, "13-todo-table-emoji.png")
+# edit diff on a permission prompt
+a.entries.clear(); a.lines_cache = None
+a.handle({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "e1", "name": "Edit", "input": {
+    "file_path": "/home/pi/clawputer/hello.py", "old_string": "print('hi')\nx = 1\n", "new_string": "print('hello world')\nx = 2\n"}}]}})
+a.handle({"type": "control_request", "request_id": "p1", "request": {"subtype": "can_use_tool", "tool_name": "Edit",
+          "input": {"file_path": "/home/pi/clawputer/hello.py"}}})
+check([k for k, _ in a.entries] == ["tool", "diff", "ask"], "Edit shows a diff before the prompt")
+d = dict(a.entries)["diff"]
+check("-print('hi')" in d and "+print('hello world')" in d, "diff has the removed and added lines")
+save(a, "14-edit-diff.png")
+a.prompt_t -= 1; a.key("n")
+# picture preview (claude made one with a command)
+from PIL import Image as _I
+pic = os.path.join(OUT, "plot.png")
+im = _I.new("RGB", (300, 200), (30, 30, 60))
+from PIL import ImageDraw as _D
+dd = _D.Draw(im)
+for i in range(0, 300, 6):
+    dd.line((i, 190 - (i * i) // 600, i + 6, 190 - ((i + 6) ** 2) // 600), fill=(217, 119, 87), width=3)
+im.save(pic)
+a.entries.clear(); a.lines_cache = None; a.cwd = OUT
+a.handle({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "b1", "name": "Bash",
+          "input": {"command": "python3 plot.py && echo saved plot.png"}}]}})
+a.handle({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "b1", "content": "saved plot.png"}]}})
+check(a.entries[-1] == ("image", pic), "a picture made by a command is shown afterwards")
+a.add("assistant", "there's your plot")
+save(a, "15-image.png")
+# dim when idle, the waking key does nothing else
+lvl = []
+g.backlight_set = lambda v: lvl.append(v)
+g.backlight_get = lambda: 80
+a.cfg["dim"] = "1 min"; a.last_key = time.time() - 61; a.dimmed = False; a.bright = 80
+a.dim_tick()
+check(a.dimmed and lvl and lvl[-1] == 10, "dims after a minute idle (%r)" % lvl)
+a.wake_screen()
+check(not a.dimmed and lvl[-1] == 80, "any key brings the brightness back")
+# setting descriptions exist for the new settings
+check(all(k in g.SETTING_HELP for k in ("prompt_sound", "dim", "maxboost")), "new settings have descriptions")
 
 print("\n%d failed" % len(fails) if fails else "\nall passed")
 sys.exit(1 if fails else 0)

@@ -1,10 +1,23 @@
 #!/bin/bash
 # clawputer-bootmode enter : next boot ONLY uses gpu_mem=16 (more RAM, camera off), reboot now
 # clawputer-bootmode exit  : reboot (the original setting was already restored at boot)
-# clawputer-bootmode reset : restore the original gpu_mem (runs at every boot)
+# clawputer-bootmode reset : restore the original gpu_mem (runs at every boot; skipped while kept)
+# clawputer-bootmode keep on|off : keep max boost across reboots (no double reboot after a power-off)
 CFG=/boot/firmware/config.txt
 [ -f "$CFG" ] || CFG=/boot/config.txt
 SAVE=/var/lib/clawputer/gpu_mem.orig
+KEEP=/etc/clawputer/keep-max-boost     # exists: max boost stays on across reboots
+restore(){
+  [ -f "$SAVE" ] || return 0
+  orig=$(cat "$SAVE")
+  if [ "$orig" = none ]; then
+    sed -i '/^gpu_mem=16$/d' "$CFG"
+  else
+    sed -i "s/^gpu_mem=16$/$orig/" "$CFG"
+  fi
+  rm -f "$SAVE"; sync
+  echo "gpu_mem restored for next boot"
+}
 case "${1:-}" in
   enter)
     mkdir -p "$(dirname "$SAVE")"
@@ -17,16 +30,13 @@ case "${1:-}" in
       echo "gpu_mem=16" >> "$CFG"
     fi
     sync; systemctl reboot ;;
-  exit) sync; systemctl reboot ;;
-  reset)
-    [ -f "$SAVE" ] || exit 0
-    orig=$(cat "$SAVE")
-    if [ "$orig" = none ]; then
-      sed -i '/^gpu_mem=16$/d' "$CFG"
-    else
-      sed -i "s/^gpu_mem=16$/$orig/" "$CFG"
-    fi
-    rm -f "$SAVE"; sync
-    echo "gpu_mem restored for next boot" ;;
-  *) echo "usage: clawputer-bootmode enter|exit|reset"; exit 1 ;;
+  exit) restore; sync; systemctl reboot ;;          # back to normal now, even if "keep" is on
+  reset) [ -f "$KEEP" ] && exit 0; restore ;;       # every boot: one-boot max boost, unless kept
+  keep)
+    case "${2:-}" in
+      on)  mkdir -p "$(dirname "$KEEP")"; touch "$KEEP" ;;
+      off) rm -f "$KEEP" ;;
+      *) echo "usage: clawputer-bootmode keep on|off"; exit 1 ;;
+    esac ;;
+  *) echo "usage: clawputer-bootmode enter|exit|reset|keep on|off"; exit 1 ;;
 esac

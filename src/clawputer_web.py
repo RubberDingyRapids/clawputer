@@ -312,6 +312,11 @@ margin:1px 0 5px;padding-bottom:5px;border-bottom:1px dashed var(--box)}
 .box.open .fullcmd{display:block}
 .box.pend{border-color:transparent;padding:0 4px}.box.pend legend{padding:0}.box.pend legend::before{content:"▸ "}
 .box.err{border-color:#6e3c3c;color:var(--err)}
+.box.diff legend,.box.todo legend{color:var(--acc)}
+.add{color:var(--ok)}.del{color:var(--err)}.hunk{color:var(--dim)}.done{color:var(--dim)}.doing{color:var(--acc)}
+.m table{border-collapse:collapse;margin:4px 0;font-size:13.5px;white-space:normal}
+.m th,.m td{border:1px solid var(--box);padding:2px 8px;text-align:left;vertical-align:top}
+.m th{color:var(--acc)}
 .txt{position:relative;overflow:hidden;white-space:pre-wrap;overflow-wrap:anywhere}
 .cut{cursor:pointer}
 .cut:not(.open) .txt::after{content:"";position:absolute;left:0;right:0;bottom:0;height:1.5em;
@@ -390,14 +395,34 @@ let v=-1,gen=-1,have=0,S={},scr=0,lastAsk='';
 const $=id=>document.getElementById(id),log=$('log'),inp=$('inp');
 function hide(e){e.classList.remove('show')}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function inl(s){return esc(s).replace(/`([^`\n]+)`/g,'<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g,'<b>$1</b>')
+  .replace(/^#{1,4} (.*)$/,'<b class=h>$1</b>')}
+// markdown tables -> real tables, everything else line by line
+function mdText(p){
+  const out=[];let tb=[];
+  const flush=()=>{if(!tb.length)return;
+    const rows=tb.map(r=>r.trim().replace(/^\|/,'').replace(/\|$/,'').split('|').map(c=>c.trim()))
+      .filter(r=>!r.every(c=>c===''||/^:?-{2,}:?$/.test(c)));
+    out.push('<table>'+rows.map((r,i)=>'<tr>'+r.map(c=>(i?'<td>':'<th>')+inl(c)+(i?'</td>':'</th>')).join('')+'</tr>').join('')+'</table>');tb=[]};
+  p.split('\n').forEach(l=>{if(l.trim().startsWith('|'))tb.push(l);else{flush();out.push(inl(l))}});
+  flush();return out.join('\n')}
 function md(t){
   let out='',parts=t.split(/```/);
   parts.forEach((p,i)=>{
     if(i%2){p=p.replace(/^[\w+-]*\n/,'');out+='<pre>'+esc(p.replace(/\n$/,''))+'</pre>'}
-    else out+=esc(p).replace(/`([^`\n]+)`/g,'<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g,'<b>$1</b>')
-      .replace(/^#{1,4} (.*)$/gm,'<b class=h>$1</b>');
+    else out+=mdText(p);
   });return out}
 function add(kind,text){
+  if(kind=='diff'||kind=='todo'){                   // edit preview / claude's to-do list
+    const d=document.createElement('fieldset');d.className='box '+kind;
+    const l=document.createElement('legend'),lines=text.split('\n');
+    l.textContent=kind=='diff'?'changes':'to-do '+lines.filter(x=>x.startsWith('✓')).length+'/'+lines.length;
+    const t=document.createElement('div');t.className='txt';
+    lines.forEach(x=>{const r=document.createElement('div');r.textContent=x;
+      r.className=kind=='diff'?(x[0]=='+'?'add':x[0]=='-'?'del':x.startsWith('@@')?'hunk':''):(x[0]=='✓'?'done':x[0]=='▶'?'doing':'');
+      t.appendChild(r)});
+    d.appendChild(l);d.appendChild(t);log.appendChild(d);return}
+  if(kind=='image'){text='🖼 picture: '+text.split('/').pop()+' (on the cardputer)';kind='info'}
   if(kind=='tool'){                                  // waits for its output, then becomes the box label
     const d=document.createElement('fieldset');d.className='box pend';
     const l=document.createElement('legend');l.textContent=text.replace(/^▸ /,'');d.appendChild(l);

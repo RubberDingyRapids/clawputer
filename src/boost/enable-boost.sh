@@ -33,7 +33,7 @@ systemctl daemon-reload
 systemctl enable clawputer-bootmode-reset.service >/dev/null 2>&1
 
 cat > /etc/sudoers.d/clawputer <<EOF
-$U ALL=(root) NOPASSWD: /usr/local/sbin/clawputer-boost on, /usr/local/sbin/clawputer-boost off, /usr/local/sbin/clawputer-bootmode enter, /usr/local/sbin/clawputer-bootmode exit
+$U ALL=(root) NOPASSWD: /usr/local/sbin/clawputer-boost on, /usr/local/sbin/clawputer-boost off, /usr/local/sbin/clawputer-bootmode enter, /usr/local/sbin/clawputer-bootmode exit, /usr/local/sbin/clawputer-bootmode keep on, /usr/local/sbin/clawputer-bootmode keep off
 EOF
 chmod 440 /etc/sudoers.d/clawputer
 visudo -cf /etc/sudoers.d/clawputer >/dev/null
