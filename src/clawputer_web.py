@@ -276,7 +276,8 @@ header h1{font-size:16px;margin:0;color:var(--acc);font-weight:650}
 main{flex:1;min-height:0;overflow-y:auto;padding:12px var(--side);display:flex;flex-direction:column;gap:8px}
 main>*{flex-shrink:0}
 .m{max-width:92%;padding:8px 12px;border-radius:14px;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}
-.user{align-self:flex-end;background:#1e3448;color:#d7ebff;border-bottom-right-radius:4px}
+.user{align-self:stretch;max-width:100%;background:#13131a;border:1px solid var(--line);border-radius:6px;color:var(--user);padding:6px 10px}
+.user::before{content:"› ";color:var(--dim)}
 .assistant{align-self:stretch;max-width:100%;padding:2px 4px}
 .h{color:var(--acc)}
 /* a command and its output: one box, the command written on the top border (like the cardputer) */
