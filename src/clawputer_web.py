@@ -283,7 +283,9 @@ main>*{flex-shrink:0}
 .box{align-self:stretch;min-width:0;min-inline-size:0;width:100%;margin:2px 0;border:1px solid var(--box);border-radius:4px;padding:1px 9px 5px;
 font:12.5px/1.4 ui-monospace,Menlo,Consolas,monospace;color:var(--res);--fade:var(--bg)}
 .box legend{color:var(--tool);padding:0 5px;max-width:calc(100% - 8px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.box.open legend{white-space:pre-wrap;word-break:break-all}
+.box .fullcmd{display:none;color:var(--tool);white-space:pre-wrap;word-break:break-all;
+margin:1px 0 5px;padding-bottom:5px;border-bottom:1px dashed var(--box)}
+.box.open .fullcmd{display:block}
 .box.pend{border-color:transparent;padding:0 4px}.box.pend legend{padding:0}.box.pend legend::before{content:"▸ "}
 .box.err{border-color:#6e3c3c;color:var(--err)}
 .txt{position:relative;overflow:hidden;white-space:pre-wrap;overflow-wrap:anywhere}
@@ -395,6 +397,8 @@ function clip(d,t){
   if(!longCmd&&!over)return;
   const lh=parseFloat(getComputedStyle(t).lineHeight)||16;
   const n=over?Math.max(1,Math.round((t.scrollHeight-t.clientHeight)/lh)):0;
+  if(longCmd){                                       // unfolded: the whole command inside the box
+    const f=document.createElement('div');f.className='fullcmd';f.textContent=l.textContent;d.insertBefore(f,t)}
   const m=document.createElement('div');m.className='more';d.appendChild(m);d.classList.add('cut');
   const label=()=>{m.textContent=d.classList.contains('open')?'▾ show less':(n?'▸ '+n+' more line'+(n>1?'s':''):'▸ full command')};
   label();d.onclick=()=>{if(getSelection().toString())return;
