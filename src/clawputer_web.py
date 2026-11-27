@@ -143,7 +143,13 @@ class WebUI:
             def log_message(self, *a):
                 pass
 
-            def authed(self):
+            def authed(self, q=None):
+                hk = self.headers.get("X-CP-Key", "")
+                if hk and hmac.compare_digest(hk, web.key):
+                    return True
+                qk = ((q or {}).get("k") or [""])[0]
+                if qk and hmac.compare_digest(qk, web.key):
+                    return True
                 ck = self.headers.get("Cookie", "")
                 for part in ck.split(";"):
                     k, _, v = part.strip().partition("=")
@@ -170,14 +176,19 @@ class WebUI:
                     k = (q.get("k") or [""])[0]
                     if k:
                         if hmac.compare_digest(k, web.key):
-                            ck = "cpk=%s; Path=/; Max-Age=31536000; HttpOnly; SameSite=Strict" % web.key
-                            return self.send(303, "", "text/plain", [("Location", "/"), ("Set-Cookie", ck)])
+                            # serve the page straight away (no redirect): a QR scan opens the link from
+                            # another app, and browsers drop SameSite=Strict cookies on that redirect,
+                            # which bounced you back to the login page. The page also keeps the key in
+                            # localStorage and sends it as a header, so cookies don't matter at all.
+                            # Lax is fine: POSTs need the X-CP header anyway (no CSRF).
+                            ck = "cpk=%s; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax" % web.key
+                            return self.send(200, PAGE, "text/html; charset=utf-8", [("Set-Cookie", ck)])
                         return self.send(200, LOGIN_PAGE.replace("<!--bad-->", "<p class=bad>wrong key</p>"),
                                          "text/html; charset=utf-8")
                     if not self.authed():
                         return self.send(200, LOGIN_PAGE, "text/html; charset=utf-8")
                     return self.send(200, PAGE, "text/html; charset=utf-8")
-                if not self.authed():
+                if not self.authed(q):
                     return self.send(401, '{"error":"key"}')
                 if u.path == "/api/state":
                     return self.state(q)
@@ -239,7 +250,9 @@ h1{color:#e8875b;font-weight:600}input{font-size:18px;padding:10px;border-radius
 background:#22222c;color:#eee;width:200px}button{font-size:18px;padding:10px 18px;border:0;border-radius:10px;
 background:#e8875b;color:#111;margin-left:6px}.bad{color:#f66}p{color:#999}</style></head><body>
 <form method=get action="/"><h1>Clawputer</h1><p>enter the key shown on the Cardputer</p><!--bad-->
-<input name=k autofocus autocomplete=off autocapitalize=off><button>open</button></form></body></html>"""
+<input name=k autofocus autocomplete=off autocapitalize=off><button>open</button></form>
+<script>try{const k=localStorage.getItem('cpk');if(k&&!/[?&]k=/.test(location.search))location.replace('/?k='+encodeURIComponent(k))
+else if(/[?&]k=/.test(location.search))localStorage.removeItem('cpk')}catch(e){}</script></body></html>"""
 
 PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,interactive-widget=resizes-content">
@@ -257,13 +270,15 @@ header h1{font-size:16px;margin:0;color:var(--acc);font-weight:650}
 #batt{color:var(--dim);font-size:12px}
 .hb{background:none;border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:5px 9px;font-size:13px;cursor:pointer}
 .hb:hover{border-color:var(--acc)}
-main{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px}
+main{flex:1;min-height:0;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px}
+main>*{flex-shrink:0}
 .m{max-width:min(760px,92%);padding:8px 12px;border-radius:14px;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}
 .user{align-self:flex-end;background:#25344d;color:#dbe8ff;border-bottom-right-radius:4px}
 .assistant{align-self:flex-start;background:var(--panel);border-bottom-left-radius:4px}
 .tool{align-self:flex-start;color:var(--tool);font:13px ui-monospace,Menlo,Consolas,monospace;padding:2px 6px}
-.result,.err{align-self:flex-start;font:12px ui-monospace,Menlo,Consolas,monospace;color:var(--dim);
-background:#191920;border-left:3px solid var(--line);border-radius:6px;padding:4px 8px;max-height:7.5em;overflow:hidden;cursor:pointer}
+.result,.err{align-self:flex-start;font:12.5px/1.4 ui-monospace,Menlo,Consolas,monospace;color:#c9c9d4;
+background:#101016;border:1px solid var(--line);border-left:3px solid #4a4a5c;border-radius:6px;padding:5px 9px;
+max-height:calc(8.4em + 10px);overflow:hidden;cursor:pointer}
 .result.open,.err.open{max-height:none}
 .err{color:var(--err);border-left-color:#6b2b2b}
 .info,.queued{align-self:center;color:var(--dim);font-size:12.5px;padding:0 6px}
@@ -328,6 +343,11 @@ border-radius:10px;padding:8px 10px;font-size:15px}
 <button class=b onclick="typeKeys()">type</button></div></div></div>
 
 <script>
+let K='';
+try{K=new URLSearchParams(location.search).get('k')||localStorage.getItem('cpk')||'';
+  if(K)localStorage.setItem('cpk',K)}catch(e){}
+if(location.search)history.replaceState(null,'','/');
+const H=K?{'X-CP-Key':K}:{};
 let v=-1,gen=-1,have=0,S={},scr=0,lastAsk='';
 const $=id=>document.getElementById(id),log=$('log'),inp=$('inp');
 function hide(e){e.classList.remove('show')}
@@ -346,7 +366,7 @@ function add(kind,text){
   if(kind=='result'||kind=='err')d.onclick=()=>d.classList.toggle('open');
   log.appendChild(d)}
 async function act(o){
-  try{const r=await fetch('/api/act',{method:'POST',headers:{'X-CP':'1','Content-Type':'application/json'},body:JSON.stringify(o)});
+  try{const r=await fetch('/api/act',{method:'POST',headers:{...H,'X-CP':'1','Content-Type':'application/json'},body:JSON.stringify(o)});
     if(r.status==401)location.reload()}catch(e){}}
 function k(key){act({a:'key',k:key});setTimeout(refreshScreen,250)}
 function typeKeys(){const t=$('kt').value;$('kt').value='';[...t].forEach(c=>act({a:'key',k:c}));setTimeout(refreshScreen,300)}
@@ -412,12 +432,12 @@ function fillSettings(){const L=$('setlist');if(L.contains(document.activeElemen
   L.innerHTML=(S.settings||[]).map(([key,label,ch])=>`<div class=set><span>${esc(label)}</span>
   <select onchange="act({a:'set',key:'${key}',value:this.value})">${ch.map(c=>`<option ${S.cfg[key]==c?'selected':''}>${esc(c)}</option>`).join('')}</select></div>`).join('')}
 function openScreen(){$('screen').classList.add('show');scr=1;refreshScreen()}
-function refreshScreen(){if(!scr)return;$('scrimg').src='/screen.png?'+Date.now()}
+function refreshScreen(){if(!scr)return;$('scrimg').src='/screen.png?k='+encodeURIComponent(K)+'&t='+Date.now()}
 setInterval(refreshScreen,1000);
 async function poll(){
   for(;;){
     try{
-      const r=await fetch(`/api/state?v=${v}&gen=${gen}&have=${have}`);
+      const r=await fetch(`/api/state?v=${v}&gen=${gen}&have=${have}`,{headers:H});
       if(r.status==401){location.reload();return}
       const j=await r.json();$('off').style.display='none';
       const stick=nearBottom();
