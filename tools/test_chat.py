@@ -283,5 +283,66 @@ child = _sp.Popen(["sleep", "5"])
 check(a.sudo_authed(g.os.getpid()), "sudo_authed spots a non-askpass child")
 child.kill(); child.wait()
 
+
+# ---- 0.6.0 ideas ----
+a.entries.clear(); a.queue.clear(); a.input = ""; a.busy = False; a.pending = None; a.scroll = 0
+a.lines_cache = None
+# wrap cache: same message laid out once
+a.wrap_memo.clear()
+r1 = a.wrap("assistant", "hello there " * 20)
+r2 = a.wrap("assistant", "hello there " * 20)
+check(r1 is r2, "a message is wrapped once, then cached")
+# view stays still while scrolled up + "↓ new"
+for i in range(30):
+    a.add("assistant", "msg %d" % i)
+a.draw()
+a.scroll = 5
+a.draw()
+before = a.all_lines()[len(a.all_lines()) - a.scroll - 1]
+a.add("assistant", "a brand new reply")
+a.draw()
+after = a.all_lines()[len(a.all_lines()) - a.scroll - 1]
+check(before == after and a.new_below, "new replies don't move what you're reading; ↓ new shows")
+save(a, "10-new-below.png")
+a.scroll = 0
+a.draw()
+check(not a.new_below, "↓ new clears at the bottom")
+# queued count
+a.queue[:] = ["x", "y"]
+cap = []
+class D:
+    def __getattr__(self, n): return lambda *x, **k: cap.append(x)
+a.draw_status(D())
+check(any("2 queued" in str(x[1]) for x in cap if len(x) > 1), "status bar shows '2 queued'")
+a.queue.clear()
+# settings: descriptions, web state, switch target
+a.open_menu()
+a.menu = [x[0] for x in g.SETTINGS].index("permissions")
+a.submenu = g.SETTINGS[a.menu][2].index("bypassPermissions")
+cap.clear()
+a.draw_menu(D())
+check(any("⚠ runs everything" in str(x[1]) for x in cap if len(x) > 1), "bypassPermissions shows a warning")
+a.draw()
+shots[-1].save(os.path.join(OUT, "11-settings-help.png"))
+a.submenu = None
+a.menu = [x[0] for x in g.SETTINGS].index("@switch")
+check(a.menu_value("@switch") == "→ pc" and a.menu_value("@web") == "off", "switch / web ui show their state")
+a.draw()
+shots[-1].save(os.path.join(OUT, "12-settings-switch.png"))
+a.menu = None
+# switch: writes the request for the launcher and quits (pc must be set up)
+import tempfile
+tmp = tempfile.mkdtemp()
+real_conf = g.CONF
+g.CONF = tmp
+g.setup.remote_cfg = lambda: {"host": "pc", "user": "me"}
+try:
+    a.run_action("@switch")
+    quit_ok = False
+except SystemExit:
+    quit_ok = True
+check(quit_ok and open(os.path.join(tmp, "switch")).read() == "pc", "switch -> writes 'pc' for the launcher and quits")
+g.CONF = real_conf
+
 print("\n%d failed" % len(fails) if fails else "\nall passed")
 sys.exit(1 if fails else 0)

@@ -72,10 +72,42 @@ SETTINGS = [
     ("enter", "enter key", ["send", "new line"], False),
     ("web", "web ui on open", ["off", "on"], False),
     ("@web", "web ui: start / stop", None, False),
+    ("@switch", "switch where claude runs", None, False),
     ("@remote", "remote pc setup", None, False),
     ("@about", "about / version", None, False),
     ("@signout", "sign out of claude", None, False),
 ]
+# one line about each setting (and each choice, where it matters), shown under the menu
+SETTING_HELP = {
+    "model": "which claude model. default = your plan's default.",
+    "effort": "how hard claude thinks: higher is slower but better.",
+    "permissions": "what claude may do without asking you first.",
+    "font": "text size in the chat.",
+    "tool_lines": "lines of command output shown in each box (the web ui can unfold them).",
+    "start": "what opens when you start a chat.",
+    "style": "plain = like a terminal. bubbles = your messages in bubbles + nicer markdown.",
+    "chime": "a sound when claude finishes or needs you while minimised.",
+    "dblspace": "two spaces type a full stop and a space, like a phone keyboard.",
+    "enter": "what enter does. the other way to send is ctrl+enter.",
+    "web": "start the web ui (use the chat from a phone / pc browser) every time.",
+    "@web": "the chat in any browser on your network, with a key. on / off now.",
+    "@switch": "carry on in a fresh chat on the other machine (your pc <-> this cardputer).",
+    "@remote": "set up / test / forget the pc that runs claude in pc mode.",
+    "@about": "versions, account, memory.",
+    "@signout": "sign this cardputer out of claude.",
+}
+CHOICE_HELP = {
+    ("permissions", "ask"): "asks before running commands or editing files.",
+    ("permissions", "acceptEdits"): "edits files without asking; still asks for commands.",
+    ("permissions", "auto"): "claude decides what's safe and only asks about risky things.",
+    ("permissions", "plan"): "plans only: looks around, changes nothing.",
+    ("permissions", "dontAsk"): "never asks: anything not already allowed is refused.",
+    ("permissions", "bypassPermissions"): "⚠ runs everything without asking. only if you trust it.",
+    ("model", "default"): "whatever your plan uses by default.",
+    ("model", "haiku"): "fastest and lightest, good for quick questions.",
+    ("model", "opus"): "the most capable; slower and uses more of your limits.",
+    ("effort", "max"): "⚠ thinks the longest: slow and heavy on usage limits.",
+}
 DEFAULTS = {"model": "default", "effort": "default", "permissions": "ask", "font": "10", "tool_lines": "3", "start": "last chat",
             "dblspace": "on", "enter": "send", "web": "off", "style": "plain", "chime": "on"}
 
@@ -577,6 +609,9 @@ class App:
         self.reboot_after = False  # "reboot back to normal?" said yes on quit
         self.unseen = False        # something happened while minimised
         self.prompt_t = 0          # when the current permission prompt / question appeared
+        self.wrap_memo = {}        # (message, layout settings) -> wrapped lines
+        self.seen_len = 0          # chat length at the last draw (keeps the view still while scrolled up)
+        self.new_below = False     # new lines arrived below while you're scrolled up
         self.interrupted = False   # you stopped claude: don't send the next queued message
         self.cc_version = ""       # claude code version (from its init message)
         self.model = ""            # short model name for the status bar badge
@@ -848,6 +883,8 @@ class App:
         self.load_draft()
 
     def open_history(self):
+        if REMOTE:
+            self.splash("loading chats from your pc...")
         self.hist = list_chats()
         self.hist_sel = 0
         self.hist_confirm = False
@@ -1364,6 +1401,7 @@ class App:
             "y  n  a      answer prompts  (j = jump down)",
             "F2           settings",
             "F3           chats (n new, d delete)",
+            "in menus     f / x move, enter pick, esc back",
             "/new         new chat",
             "ctrl+q       quit",
         ])
@@ -1586,6 +1624,26 @@ class App:
         self.dirty = False
 
     def run_action(self, key):
+        if key == "@switch":
+            target = "local" if REMOTE else "pc"
+            if target == "pc" and not setup.remote_cfg():
+                self.add("info", "  no pc set up yet: F2 > remote pc setup first.")
+                return
+            if target == "local" and not setup.claude_installed():
+                self.add("info", "  claude code isn't on this cardputer yet: quit, then pick 'on this cardputer'.")
+                return
+            if not self.ok_to_switch():
+                return
+            try:
+                with open(os.path.join(CONF, "switch"), "w") as f:
+                    f.write(target)              # the launcher script starts the other kind of chat
+                with open(os.path.join(CONF, "ui"), "w") as f:
+                    f.write(target)
+            except OSError as e:
+                log("switch", e)
+                return
+            self.splash("switching to " + ("this cardputer..." if target == "local" else "your pc..."))
+            raise SystemExit
         if key == "@web":
             if self.web:
                 self.stop_web()
@@ -1629,22 +1687,33 @@ class App:
                 self.draw()
                 self.start_claude(resume=self.session_id)
 
+    def menu_value(self, key):
+        if key == "@web":
+            return "on" if self.web else "off"
+        if key == "@switch":
+            return "→ cardputer" if REMOTE else "→ pc"
+        return self.cfg.get(key, "→")
+
     def draw_menu(self, d):
         if self.submenu is None:
             title = "settings"
-            items = [(label, self.cfg.get(key, "→")) for key, label, _, _ in SETTINGS]
+            items = [(label, self.menu_value(key)) for key, label, _, _ in SETTINGS]
             sel = self.menu
             hint = "f up  x down  enter open  esc close"
+            key = SETTINGS[sel][0]
+            about = SETTING_HELP.get(key, "")
         else:
             key, label, choices, _ = SETTINGS[self.menu]
             title = "settings > " + label
             items = [(c, "current" if c == self.cfg[key] else "") for c in choices]
             sel = self.submenu
             hint = "f up  x down  enter pick  esc back"
-        rows_fit = 7
+            about = CHOICE_HELP.get((key, choices[sel])) or SETTING_HELP.get(key, "")
+        about = textwrap.wrap(about, int((W - 50) / self.small.getlength("M")))[:2]
+        rows_fit = 6 if about else 7
         first = max(0, min(sel - rows_fit // 2, len(items) - rows_fit))
         shown = items[first:first + rows_fit]
-        bh = len(shown) * 14 + 32
+        bh = len(shown) * 14 + 32 + len(about) * 11 + (3 if about else 0)
         top = (H - bh) // 2
         d.rectangle((14, top, W - 14, top + bh), fill=(25, 25, 35), outline=ACCENT)
         d.text((22, top + 4), title, font=self.small, fill=ACCENT)
@@ -1657,10 +1726,24 @@ class App:
             d.text((24, y), ("> " if on else "  ") + name, font=self.small, fill=FG if on else DIM)
             if val:
                 d.text((W - 24 - self.small.getlength(val), y), val, font=self.small, fill=ACCENT if on else FG)
+        y = top + 18 + len(shown) * 14 + 1
+        for ln in about:
+            d.text((22, y), ln, font=self.small, fill=ERR if about[0].startswith("⚠") else DIM)
+            y += 11
         d.text(((W - self.small.getlength(hint)) // 2, top + bh - 12), hint, font=self.small, fill=DIM)
 
     # -- drawing --
     def wrap(self, kind, text, label=""):
+        """cached _wrap(): a message is laid out once (until the font / style / settings change)"""
+        k = (kind, text, label, self.cols, self.cfg.get("style"), self.cfg["tool_lines"])
+        hit = self.wrap_memo.get(k)
+        if hit is None:
+            if len(self.wrap_memo) > 3000:
+                self.wrap_memo.clear()
+            hit = self.wrap_memo[k] = self._wrap(kind, text, label)
+        return hit
+
+    def _wrap(self, kind, text, label=""):
         """-> list of (kind, text, boxpos); boxpos None, or top (border + label) / mid / bot"""
         out = []
         width = self.cols - 2
@@ -1832,6 +1915,8 @@ class App:
             left = "offline: " + ("can't reach your pc" if REMOTE else "no internet")
         else:
             left = "claude · " + self.status
+        if self.queue:                       # first, so a full status bar cuts the rest, not this
+            left = "%d queued · " % len(self.queue) + left.replace("claude · ", "")
         sm = self.small
         x = W - 3
         clock = time.strftime("%H:%M")
@@ -1937,6 +2022,12 @@ class App:
         # conversation
         lines = self.all_lines()
         n = self.view_lines()
+        if self.scroll and len(lines) > self.seen_len:
+            self.scroll += len(lines) - self.seen_len   # keep what you're reading where it is
+            self.new_below = True
+        self.seen_len = len(lines)
+        if not self.scroll:
+            self.new_below = False
         maxscroll = max(0, len(lines) - n)
         self.scroll = min(self.scroll, maxscroll)
         end = len(lines) - self.scroll
@@ -2029,6 +2120,12 @@ class App:
             self.draw_ask(d)
         if self.pending and self.scroll and self.menu is None and self.hist is None:
             self.draw_pending(d)
+        elif self.new_below and self.scroll and self.menu is None and self.hist is None:
+            pill = " ↓ new "
+            pw = self.small.getlength(pill)
+            py = H - (len(self.input_lines()) * self.lh + 18)
+            d.rounded_rectangle((W - 14 - pw, py, W - 10, py + 11), radius=5, fill=ACCENT)
+            d.text((W - 12 - pw, py), pill, font=self.small, fill=BG)
         if self.menu is not None:
             self.draw_menu(d)
         elif self.hist is not None:

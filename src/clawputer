@@ -27,6 +27,47 @@ wait_chat(){
   while [ -e "/proc/$p" ] && [ "$(gui_state)" != hidden ]; do sleep 0.3; done
 }
 
+# start the chat for CHOICE (pc / local / local-noboost) and wait while it's on screen
+start_chat(){
+  local env=(-E CLAWPUTER_HIDE=1 -E CLAWPUTER_CHECKED=1 -E PYTHONPATH="$SHARE" -E PATH="$PATH"
+             -E LANG="${LANG:-C.UTF-8}" -E DISABLE_AUTOUPDATER=1 -E CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1)
+  [ -n "${APPLAUNCH_LINUX_FBDEV_DEVICE:-}" ] && env+=(-E APPLAUNCH_LINUX_FBDEV_DEVICE="$APPLAUNCH_LINUX_FBDEV_DEVICE")
+  case "$1" in
+    pc)            env+=(-E CLAWPUTER_REMOTE=1 -E CLAUDE_REMOTE=1);;
+    local)         boost_ok && env+=(-E CLAWPUTER_BOOST=1);;
+    local-noboost) ;;
+    *)             return 1;;
+  esac
+  # the last chat may still be closing (putting the ram boost back): wait for it, or the new one
+  # can't start under the same name
+  local st p=
+  for _ in $(seq 1 120); do
+    st=$(systemctl --user show -p ActiveState --value "$UNIT" 2>/dev/null)
+    case "$st" in active|deactivating|activating|reloading) sleep 0.25;; *) break;; esac
+  done
+  systemctl --user reset-failed "$UNIT" >/dev/null 2>&1
+  # OOMScoreAdjust: if memory ever runs out, the kernel picks claude, not the launcher.
+  # ExecStopPost: however the chat ends (quit, crash, killed), the ram boost gets put back.
+  mkdir -p "$HOME/clawputer"
+  rm -f "$STATE"
+  systemd-run --user --quiet --collect --unit="$UNIT" --working-directory="$HOME/clawputer" \
+    -p OOMScoreAdjust=500 -p KillMode=mixed -p TimeoutStopSec=20 \
+    -p StandardError="append:$CONF/gui.log" -p ExecStopPost="$SHARE/clawputer-cleanup" \
+    "${env[@]}" python3 "$GUI" || return 1
+  for _ in $(seq 1 20); do p=$(chat_pid); [ -n "$p" ] && [ "$p" != 0 ] && break; sleep 0.1; done
+  [ -n "$p" ] && [ "$p" != 0 ] && wait_chat "$p"
+  return 0
+}
+
+# the chat asked to carry on on the other machine (F2 > switch): -> its choice, else nothing
+next_switch(){
+  local c=
+  [ "$(gui_state)" = hidden ] && return 1          # minimised, not switching
+  read -r c < "$CONF/switch" 2>/dev/null || return 1
+  rm -f "$CONF/switch"
+  case "$c" in pc|local) echo "$c";; *) return 1;; esac
+}
+
 # ---- a minimised chat? wake it up ----
 if chat_running; then
   P=$(chat_pid)
@@ -34,6 +75,7 @@ if chat_running; then
     echo waking > "$STATE"
     kill -USR1 "$P"
     wait_chat "$P"
+    while C=$(next_switch); do start_chat "$C" || break; done
     exit 0
   fi
   # running but not minimised (stuck, or still closing): close it properly, start fresh
@@ -46,33 +88,7 @@ rm -f "$CONF/choice"
 PYTHONPATH="$SHARE" python3 "$GUI" --menu < /dev/null >/dev/null 2>>"$CONF/gui.log"
 CHOICE=$(cat "$CONF/choice" 2>/dev/null || echo quit)
 
-ENV=(-E CLAWPUTER_HIDE=1 -E CLAWPUTER_CHECKED=1 -E PYTHONPATH="$SHARE" -E PATH="$PATH"
-     -E LANG="${LANG:-C.UTF-8}" -E DISABLE_AUTOUPDATER=1 -E CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1)
-[ -n "${APPLAUNCH_LINUX_FBDEV_DEVICE:-}" ] && ENV+=(-E APPLAUNCH_LINUX_FBDEV_DEVICE="$APPLAUNCH_LINUX_FBDEV_DEVICE")
-case "$CHOICE" in
-  pc)            ENV+=(-E CLAWPUTER_REMOTE=1 -E CLAUDE_REMOTE=1);;
-  local)         boost_ok && ENV+=(-E CLAWPUTER_BOOST=1);;
-  local-noboost) ;;
-  *)             exit 0;;
-esac
-
-# ---- the chat, as a user service so it can outlive this script when minimised ----
-# the last chat may still be closing (putting the ram boost back): wait for it, or the new one
-# can't start under the same name
-for _ in $(seq 1 120); do
-  st=$(systemctl --user show -p ActiveState --value "$UNIT" 2>/dev/null)
-  case "$st" in active|deactivating|activating|reloading) sleep 0.25;; *) break;; esac
-done
-systemctl --user reset-failed "$UNIT" >/dev/null 2>&1
-# OOMScoreAdjust: if memory ever runs out, the kernel picks claude, not the launcher.
-# ExecStopPost: however the chat ends (quit, crash, killed), the ram boost gets put back.
-mkdir -p "$HOME/clawputer"
-rm -f "$STATE"
-systemd-run --user --quiet --collect --unit="$UNIT" --working-directory="$HOME/clawputer" \
-  -p OOMScoreAdjust=500 -p KillMode=mixed -p TimeoutStopSec=20 \
-  -p StandardError="append:$CONF/gui.log" -p ExecStopPost="$SHARE/clawputer-cleanup" \
-  "${ENV[@]}" python3 "$GUI" || exit 1
-P=
-for _ in $(seq 1 20); do P=$(chat_pid); [ -n "$P" ] && [ "$P" != 0 ] && break; sleep 0.1; done
-[ -n "$P" ] && [ "$P" != 0 ] && wait_chat "$P"
+rm -f "$CONF/switch"
+start_chat "$CHOICE" || exit 0
+while C=$(next_switch); do start_chat "$C" || break; done
 exit 0

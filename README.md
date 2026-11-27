@@ -26,7 +26,9 @@ and built-in keyboard.
 - **Minimise** (Ctrl+H): back to the launcher while Claude keeps working; a **chime** plays when
   it's done or needs you, and Claude sleeps when idle to give its RAM back
 - **Settings** (F2): model, effort, permission mode, font size, tool output lines, chat style,
-  chime, Enter = send / new line, double-space full stop
+  chime, Enter = send / new line, double-space full stop. Each option says what it does
+  (risky ones are flagged), and **switch where claude runs** hops between your PC and the
+  Cardputer without quitting
 - **Drafts autosave**, messages typed while Claude is busy are queued in order
 - **Easy setup**: installs Claude Code with Anthropic's official installer, then sign in by
   **scanning a QR code with your phone** and pasting the code there (wifi, Tailscale, or
