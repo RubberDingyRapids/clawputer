@@ -57,6 +57,13 @@ case "$CHOICE" in
 esac
 
 # ---- the chat, as a user service so it can outlive this script when minimised ----
+# the last chat may still be closing (putting the ram boost back): wait for it, or the new one
+# can't start under the same name
+for _ in $(seq 1 120); do
+  st=$(systemctl --user show -p ActiveState --value "$UNIT" 2>/dev/null)
+  case "$st" in active|deactivating|activating|reloading) sleep 0.25;; *) break;; esac
+done
+systemctl --user reset-failed "$UNIT" >/dev/null 2>&1
 # OOMScoreAdjust: if memory ever runs out, the kernel picks claude, not the launcher.
 # ExecStopPost: however the chat ends (quit, crash, killed), the ram boost gets put back.
 mkdir -p "$HOME/clawputer"

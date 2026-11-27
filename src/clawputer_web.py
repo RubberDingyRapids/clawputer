@@ -27,6 +27,23 @@ PORTS = range(8080, 8090)
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
+    MAX_CONN = 16                  # each connection is a thread; don't let the LAN exhaust our RAM
+
+    def __init__(self, *a, **k):
+        self.slots = threading.BoundedSemaphore(self.MAX_CONN)
+        super().__init__(*a, **k)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
 
     def handle_error(self, request, client_address):
         pass                       # phones drop connections all the time; not worth a traceback
@@ -139,6 +156,7 @@ class WebUI:
 
         class H(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+            timeout = 30               # idle keep-alive connections give their thread back
 
             def log_message(self, *a):
                 pass
@@ -223,6 +241,11 @@ class WebUI:
             def do_POST(self):
                 if not self.authed() or self.headers.get("X-CP") != "1":   # custom header: no CSRF
                     return self.send(401, '{"error":"key"}')
+                # nothing on the cardputer itself may press buttons here: claude can read the key
+                # file, and must not answer its own permission prompts or change its settings
+                peer = self.client_address[0].replace("::ffff:", "")
+                if peer.startswith("127.") or peer == "::1" or peer == self.connection.getsockname()[0].replace("::ffff:", ""):
+                    return self.send(403, '{"error":"not from the cardputer itself"}')
                 if urlparse(self.path).path != "/api/act":
                     return self.send(404, "{}")
                 try:
@@ -366,7 +389,7 @@ const H=K?{'X-CP-Key':K}:{};
 let v=-1,gen=-1,have=0,S={},scr=0,lastAsk='';
 const $=id=>document.getElementById(id),log=$('log'),inp=$('inp');
 function hide(e){e.classList.remove('show')}
-function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function md(t){
   let out='',parts=t.split(/```/);
   parts.forEach((p,i)=>{

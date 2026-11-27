@@ -6,11 +6,15 @@ CONF=/etc/clawputer/boost.conf
 STATE=/run/clawputer-boost.stopped
 SERVICES="lightdm cups cups-browsed avahi-daemon udisks2 accounts-daemon packagekit"
 [ -r "$CONF" ] && . "$CONF"
+exec 9>/run/clawputer-boost.lock
+flock -w 60 9 || true
 case "${1:-}" in
   on)
-    : > "$STATE"
+    # add to the list instead of starting a new one: a second "on" (e.g. after a crash) would
+    # otherwise find everything already stopped, record nothing, and "off" would restore nothing
+    touch "$STATE"
     for s in $SERVICES; do
-      systemctl is-active --quiet "$s" && echo "$s" >> "$STATE"
+      systemctl is-active --quiet "$s" && ! grep -qx "$s" "$STATE" && echo "$s" >> "$STATE"
     done
     systemctl stop avahi-daemon.socket 2>/dev/null || true
     xargs -r systemctl stop < "$STATE" 2>/dev/null || true

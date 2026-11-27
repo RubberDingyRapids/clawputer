@@ -734,13 +734,25 @@ C:\\ProgramData\\ssh\\administrators_authorized_keys), enable the SSH server, th
                     self.remote_msg = ("✓ " if ok else "✗ ") + m
                 else:
                     self.remote_msg = "no PC saved yet"
+            elif getattr(self, "remote_del", False):
+                self.remote_del = False
+                if k in ("y", "Y"):
+                    try:
+                        os.remove(REMOTE_FILE)
+                    except OSError:
+                        pass
+                    self.remote_ok = False
+                    self.remote_msg = "PC removed"
+                else:
+                    self.remote_msg = "kept"
             elif k == "d":
-                try:
-                    os.remove(REMOTE_FILE)
-                except OSError:
-                    pass
-                self.remote_ok = False
-                self.remote_msg = "PC removed"
+                if os.environ.get("CLAUDE_REMOTE") == "1":
+                    self.remote_msg = "you're using this PC right now: quit first"
+                elif remote_cfg():
+                    self.remote_del = True
+                    self.remote_msg = "forget this PC? y / n"
+                else:
+                    self.remote_msg = "no PC saved yet"
             elif k in ("tab", "right", "left"):
                 n = len(self.remote_views())
                 self.rview = (self.rview + (-1 if k == "left" else 1)) % n

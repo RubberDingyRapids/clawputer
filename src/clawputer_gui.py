@@ -127,6 +127,8 @@ BRIGHT = (255, 255, 255)     # **bold** text
 OK = (120, 210, 130)
 MD_TOKEN = re.compile(r"(\*\*[^*\n]+\*\*|`[^`\n]+`)")
 CHIME_FILE = os.path.join(CONF, "chime.wav")
+PROMPT_GRACE = 0.6       # seconds after a prompt appears when answer keys are ignored (you were typing)
+SCROLL_KEYS = ("up", "down", "left", "right", "pgup", "pgdn", "end")
 RESULT_MAX_LINES, RESULT_MAX_CHARS = 400, 40000   # tool output kept per result (web ui can unfold it)
 
 
@@ -574,6 +576,9 @@ class App:
         self.boost_wanted = os.environ.get("CLAWPUTER_BOOST") == "1" and not REMOTE
         self.reboot_after = False  # "reboot back to normal?" said yes on quit
         self.unseen = False        # something happened while minimised
+        self.prompt_t = 0          # when the current permission prompt / question appeared
+        self.interrupted = False   # you stopped claude: don't send the next queued message
+        self.cc_version = ""       # claude code version (from its init message)
         self.model = ""            # short model name for the status bar badge
         self.ctx_used = None       # tokens in claude's context (None = unknown, e.g. just compacted)
         self.ctx_window = 200000
@@ -649,6 +654,8 @@ class App:
         self.claude = ClaudeSession(claude_args(self.cfg) + list(self.extra_args), resume=resume, cwd=self.cwd)
         self.busy = False
         self.pending = None
+        self.turn = None
+        self.restart_after_turn = False
         self.status = "ready"
         if not resume and not quiet:
             self.add("info", "new chat. type a message. ctrl+q quits." +
@@ -672,6 +679,7 @@ class App:
         if t == "system" and m.get("subtype") == "init":
             self.session_id = m.get("session_id")
             self.model = short_model(m.get("model") or "")
+            self.cc_version = m.get("claude_code_version") or self.cc_version
             if "[1m]" in (m.get("model") or ""):
                 self.ctx_window = 1000000
             self.status = ("pc · " if REMOTE else "") + "ready"
@@ -687,6 +695,7 @@ class App:
                     self.claude.answer(m["request_id"], True, r.get("input", {}))
                 else:
                     self.pending = {"id": m["request_id"], "name": name, "input": r.get("input", {})}
+                    self.prompt_t = time.time()
                     self.add("ask", "? allow " + short_tool(name, r.get("input")) +
                              "\n  y yes · n no · a always (" + name + ")")
                 if name not in self.always:
@@ -711,9 +720,12 @@ class App:
                 if re.search(r"log ?in|auth|401|api key|oauth|credential", err, re.I) and not REMOTE:
                     self.add("info", "  sign-in problem? F2 > sign out of claude, then sign in again.")
             self.status = "ready · %.0fs" % secs
-            if self.queue:
+            stopped, self.interrupted = self.interrupted, False
+            if self.queue and not stopped and m.get("subtype") == "success" and not self.offline():
                 self.lines_cache = None
                 self.send_user(self.queue.pop(0))
+            elif self.queue:
+                self.add("info", "  %d queued: enter sends the next one, esc edits it." % len(self.queue))
         self.dirty = True
 
     def ingest(self, m, loading=False):
@@ -840,11 +852,25 @@ class App:
         self.hist_sel = 0
         self.hist_confirm = False
 
+    def ok_to_switch(self):
+        """claude mid-reply: switching chats stops it, so ask first"""
+        if not self.busy:
+            return True
+        k = self.dialog("claude is still working", ["switching chats stops this reply."],
+                        hint="y switch   any other key stay")
+        self.dirty = True
+        return k in ("y", "Y")
+
     def hist_key(self, k):
         items = 1 + len(self.hist)      # row 0 = "+ new chat"
         if self.hist_confirm:
             if k in ("y", "Y"):
                 chat = self.hist[self.hist_sel - 1]
+                if chat["id"] == self.session_id:
+                    if not self.ok_to_switch():
+                        self.hist_confirm = False
+                        return
+                    self.new_chat()          # stop claude first, so it can't write the file back
                 try:
                     if REMOTE:
                         remote_py("delete", chat["path"])
@@ -853,8 +879,6 @@ class App:
                     _chat_cache.pop(chat["path"], None)
                 except OSError as e:
                     log("delete failed", e)
-                if chat["id"] == self.session_id:
-                    self.new_chat()
                 self.hist = list_chats()
                 self.hist_sel = min(self.hist_sel, len(self.hist))
             self.hist_confirm = False
@@ -864,19 +888,20 @@ class App:
         elif k in ("x", "X", "down"):
             self.hist_sel = (self.hist_sel + 1) % items
         elif k in ("n", "N"):
-            self.hist = None
-            self.new_chat()
+            if self.ok_to_switch():
+                self.hist = None
+                self.new_chat()
         elif k in ("d", "D") and self.hist_sel > 0:
             self.hist_confirm = True
         elif k == "enter":
             sel = self.hist_sel
-            self.hist = None if sel == 0 else self.hist
-            if sel == 0:
-                self.new_chat()
-            else:
-                chat = self.hist[sel - 1]
+            chat = self.hist[sel - 1] if sel else None
+            same = chat and chat["id"] == self.session_id and self.claude.alive()
+            if same or self.ok_to_switch():
                 self.hist = None
-                if chat["id"] != self.session_id or not self.claude.alive():
+                if sel == 0:
+                    self.new_chat()
+                elif not same:
                     self.open_chat(chat)
         elif k in ("esc", "f3", "ctrl+o"):
             self.hist = None
@@ -923,6 +948,12 @@ class App:
         if self.modescr is not None:
             self.mode_key(k)
             return
+        if k == "ctrl+h" and CAN_HIDE and not self.menu_mode:
+            self.hide()                      # minimise any time, even mid-reply or mid-question
+            return
+        if k == "ctrl+q":
+            self.ask_reboot_back()
+            raise SystemExit
         if self.overlay:
             self.overlay = None              # any key closes help / about
             return
@@ -950,16 +981,16 @@ class App:
         if k in ("f3", "ctrl+o"):
             self.open_history()
             return
-        if k == "ctrl+h" and CAN_HIDE and not self.menu_mode:
-            self.hide()                      # minimise any time, even mid-reply
-            return
         if self.pending:
+            if k in ("j", "J"):
+                self.scroll = 0              # jump to the bottom; the prompt stays
+                return
             if k in ("y", "Y", "a", "A", "n", "N", "esc"):
-                self.answer_pending(k)
-            return
-        if k == "ctrl+q":
-            self.ask_reboot_back()
-            raise SystemExit
+                if time.time() - self.prompt_t >= PROMPT_GRACE:   # not a key you were already typing
+                    self.answer_pending(k)
+                return
+            if k not in SCROLL_KEYS:         # scrolling still works, so you can read what it's about
+                return
         if k == "up":
             self.scroll += 1
         elif k == "down":
@@ -973,9 +1004,13 @@ class App:
         elif k == "esc":
             if self.busy:
                 self.claude.interrupt()
+                self.interrupted = True
                 self.add("info", "  stopping...")
             elif self.input:
                 self.input = ""
+            elif self.queue:                 # pull the last queued message back to edit it
+                self.input = self.queue.pop()
+                self.lines_cache = None
             elif CAN_HIDE and not self.menu_mode:
                 self.hide()
         elif k == "backspace":
@@ -1071,7 +1106,8 @@ class App:
             self.claude.answer(request_id, True, tool_input)
             return
         self.ask = {"id": request_id, "input": tool_input, "qs": qs, "qi": 0, "sel": 0,
-                    "picked": set(), "answers": {}, "typing": False}
+                    "picked": set(), "answers": {}, "typing": False, "draft": self.input}
+        self.prompt_t = time.time()
         self.dirty = True
 
     def ask_options(self):
@@ -1083,6 +1119,8 @@ class App:
         q = a["qs"][a["qi"]]
         opts = self.ask_options()
         multi = bool(q.get("multiSelect"))
+        if k not in ("f", "F", "x", "X", "up", "down") and time.time() - self.prompt_t < PROMPT_GRACE:
+            return                           # still typing your message when the question popped up
         if k in ("f", "F", "up"):
             a["sel"] = (a["sel"] - 1) % len(opts)
         elif k in ("x", "X", "down"):
@@ -1101,7 +1139,7 @@ class App:
         elif k == "esc":
             self.claude.answer(a["id"], False, a["input"])
             self.add("info", "  ✗ skipped the question")
-            self.ask = None
+            self.end_ask()
 
     def ask_answer(self, answer):
         a = self.ask
@@ -1113,7 +1151,28 @@ class App:
         if a["qi"] >= len(a["qs"]):
             done = dict(a["input"], answers=a["answers"])
             self.claude.answer(a["id"], True, done)
-            self.ask = None
+            self.end_ask()
+
+    def end_ask(self):
+        """question done: give you back the message you were typing before it popped up"""
+        draft = (self.ask or {}).get("draft", "")
+        self.ask = None
+        if not self.input.strip():
+            self.input = draft
+
+    def draw_pending(self, d):
+        """permission prompt floating over the chat while you're scrolled up reading"""
+        p = self.pending
+        cw = max(1, round(self.small.getlength("M")))
+        rows = textwrap.wrap(short_tool(p["name"], p["input"]), (W - 28) // cw)[:3]
+        bottom = H - (len(self.input_lines()) * self.lh + 7)
+        top = bottom - (30 + len(rows) * 11)
+        d.rectangle((6, top, W - 6, bottom), fill=(25, 25, 35), outline=ASK)
+        d.text((14, top + 3), "allow %s?" % p["name"], font=self.small, fill=ASK)
+        for i, ln in enumerate(rows):
+            d.text((14, top + 16 + i * 11), ln, font=self.small, fill=FG)
+        hint = "y yes  n no  a always  j jmp btm"
+        d.text(((W - self.small.getlength(hint)) // 2, bottom - 12), hint, font=self.small, fill=DIM)
 
     def draw_ask(self, d):
         a = self.ask
@@ -1165,6 +1224,12 @@ class App:
                 self.ask_answer(text)
             return
         if not text:
+            if self.claude and not self.claude.alive() and not self.parked:
+                self.add("info", "  restarting claude...")
+                self.start_claude(resume=self.session_id, quiet=True)
+            elif self.queue and not self.busy:
+                self.send_user(self.queue.pop(0))
+                self.lines_cache = None
             return
         self.input = ""
         self.scroll = 0
@@ -1181,7 +1246,8 @@ class App:
             self.open_history()
             return
         if text in ("/new", "/clear"):
-            self.new_chat()
+            if self.ok_to_switch():
+                self.new_chat()
             return
         if self.offline() and not self.busy:
             self.queue.append(text)
@@ -1246,7 +1312,10 @@ class App:
             self.status = "thinking"
             self.turn = {"phase": "thinking", "done": 0, "chars": 0, "msg": 0}
         else:
-            self.add("err", "couldn't reach claude. press enter again to restart.")
+            self.entries.pop()               # not sent: put it back in the box
+            self.lines_cache = None
+            self.input = text
+            self.add("err", "couldn't reach claude. enter to try again.")
 
     # -- settings menu --
     def open_menu(self):
@@ -1292,7 +1361,7 @@ class App:
             "fn+z / fn+c  scroll a page",
             "esc          stop claude / clear box",
         ] + (["ctrl+h       minimise app (claude keeps going)"] if CAN_HIDE else []) + [
-            "y  n  a      answer permission prompts",
+            "y  n  a      answer prompts  (j = jump down)",
             "F2           settings",
             "F3           chats (n new, d delete)",
             "/new         new chat",
@@ -1300,22 +1369,18 @@ class App:
         ])
 
     def show_about(self):
-        self.splash("checking versions...")
         try:
             ver = open(os.path.join(SHARE, "VERSION")).read().strip()
         except OSError:
             ver = "dev"
-        try:
-            cmd = setup.ssh_base() + ["claude --version"] if REMOTE else [CLAUDE, "--version"]
-            cv = subprocess.run(cmd, capture_output=True, timeout=20).stdout.decode(errors="replace").split()[0]
-        except (OSError, IndexError, subprocess.TimeoutExpired):
-            cv = "?"
+        # (no `claude --version` / `claude auth status`: each loads another ~385MB claude next
+        # to the running one. the version comes from claude's start-up message instead)
+        cv = self.cc_version or "? (starts with the chat)"
         if REMOTE:
             c = setup.remote_cfg() or {}
             who, where = "(managed on the pc)", "your pc: %s@%s" % (c.get("user"), c.get("host"))
         else:
-            st = setup.auth_status()
-            who = st.get("email") or st.get("authMethod") or "not signed in"
+            who = claude_email() or ("yes" if setup.quick_signed_in() else "not signed in")
             where = "this cardputer"
         inst, gpu = boost_state()
         boost = ("active, +112MB" if gpu <= 16 else "on") if inst else "not set up"
@@ -1408,6 +1473,9 @@ class App:
 
     def pick_ram(self):
         key, _, _, choice = self.ram_options()[self.modescr["ram"]]
+        if choice in ("reboot", "local") and boost_helpers_outdated():
+            choice = "boost-setup-max" if choice == "reboot" else "boost-setup-local"
+            self.boost_update = True
         try:
             with open(os.path.join(CONF, "ram"), "w") as f:
                 f.write(key)
@@ -1437,12 +1505,20 @@ class App:
             choice = "reboot" if choice == "boost-setup-max" else "local"
         if choice == "reboot":
             self.splash("restarting with more ram...\nopen Clawputer again after it restarts.")
+            err = ""
             try:
-                subprocess.run(["sudo", "-n", BOOTMODE, "enter"], stdin=subprocess.DEVNULL,
-                               capture_output=True, timeout=60)
-                time.sleep(60)                           # the reboot takes us down
+                p = subprocess.run(["sudo", "-n", BOOTMODE, "enter"], stdin=subprocess.DEVNULL,
+                                   capture_output=True, timeout=60)
+                if p.returncode == 0:
+                    time.sleep(60)                       # the reboot takes us down
+                    err = "it didn't restart"
+                else:
+                    err = (p.stderr.decode(errors="replace").strip().splitlines() or ["error %d" % p.returncode])[-1]
             except (OSError, subprocess.TimeoutExpired) as e:
-                log("bootmode enter", e)
+                err = str(e)
+            log("bootmode enter", err)
+            self.dialog("couldn't restart", ["the max boost restart didn't work: " + err[:80],
+                                             "carrying on without it."], hint="any key")
             choice = "local"                             # didn't reboot: just run it
         try:
             os.makedirs(CONF, exist_ok=True)
@@ -1937,7 +2013,7 @@ class App:
         for i, r in enumerate(rows):
             prefix = "› " if i == 0 else "  "
             if self.pending:
-                r, prefix = "y / n / a ?", "› "
+                r, prefix = "y / n / a ?" + ("   j = jump to bottom" if self.scroll else ""), "› "
             d.text((3, top + 1 + i * self.lh), prefix + r, font=self.font, fill=col)
             if self.pending:
                 break
@@ -1951,6 +2027,8 @@ class App:
                 d.text((W - 8 - self.small.getlength(hint), top + 2), hint, font=self.small, fill=DIM)
         if self.ask and not self.ask["typing"] and self.menu is None and self.hist is None:
             self.draw_ask(d)
+        if self.pending and self.scroll and self.menu is None and self.hist is None:
+            self.draw_pending(d)
         if self.menu is not None:
             self.draw_menu(d)
         elif self.hist is not None:
@@ -2007,7 +2085,11 @@ class App:
                 self.hidden_tick()
                 continue
             if CAN_HIDE and not self.ctl_alive():
+                if self.sudo_req:
+                    self.sudo_answer(None)   # nobody's there to type it
                 self.hide()                  # the launcher script went away: give the screen back
+                if not self.hidden:
+                    time.sleep(0.5)          # (can't hide right now: don't spin)
                 continue
             fds = [self.kb.fd] + self.sudo_fds() + ([self.web.rfd] if self.web else [])
             if self.claude.alive():
@@ -2026,6 +2108,7 @@ class App:
                 msgs = self.claude.read()
                 if msgs is None:
                     self.busy = False
+                    self.pending = self.ask = self.turn = None
                     if REMOTE:
                         self.add("err", "lost the pc (is it on? ssh ok?). enter = retry.")
                     else:
@@ -2081,6 +2164,21 @@ class App:
         except (OSError, KeyError, ValueError, IndexError):
             return None
 
+    @staticmethod
+    def sudo_authed(pid):
+        """sudo has a child that isn't our askpass helper -> the password was accepted"""
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                if int(open("/proc/%s/stat" % d).read().rsplit(")", 1)[1].split()[1]) != pid:
+                    continue
+                if b"clawputer-askpass" not in open("/proc/%s/cmdline" % d, "rb").read():
+                    return True
+            except (OSError, ValueError, IndexError):
+                continue
+        return False
+
     def sudo_poll(self, r):
         if self.sudo_sock and time.time() - self.sudo_checked > 5:
             # someone replaced / removed our socket file (another clawputer that has since
@@ -2096,7 +2194,9 @@ class App:
                 self.sudo_sock = None
                 self.open_askpass()
                 return
-        if self.sudo_forget and not self.proc_running(self.sudo_forget):
+        # forget the password the moment sudo has checked it (not when the command ends): sudo's
+        # timestamp is device-wide, so a long command would otherwise let other sudo -n calls in
+        if self.sudo_forget and (not self.proc_running(self.sudo_forget) or self.sudo_authed(self.sudo_forget)):
             self.sudo_forget = None
             self.sudo_clear()
         if self.sudo_req and self.sudo_req["conn"].fileno() in r:
@@ -2183,9 +2283,10 @@ class App:
 
     def draw_sudo(self, d):
         q = self.sudo_req
-        cmd = textwrap.wrap(q["cmd"], 50)
-        if len(cmd) > 4:
-            cmd = cmd[:3] + [cmd[3][:47] + "..."]
+        shown = re.sub(r"[\x00-\x1f\x7f]", lambda c: "⏎" if c.group() == "\n" else "�", q["cmd"])
+        cmd = textwrap.wrap(shown, 50)
+        if len(cmd) > 5:                     # the start AND the end: a long command can't hide its tail
+            cmd = cmd[:2] + ["  … %d more lines …" % (len(cmd) - 4)] + cmd[-2:]
         title = "wrong password? try again" if q["retry"] else "claude wants to run as root:"
         bh = 30 + len(cmd) * 11 + 40
         top = max(2, (H - bh) // 2)
@@ -2267,6 +2368,8 @@ class App:
                 else:
                     q["remember"] = bool(a.get("remember"))
                     self.sudo_answer(str(a["pw"]))
+        elif kind in ("new", "open") and self.busy:
+            self.add("info", "  claude is still working: stop it first, then switch chats.")
         elif kind == "new":
             self.hist = None
             self.new_chat()
@@ -2389,13 +2492,16 @@ class App:
                     pw += k
 
     def setup_boost(self):
-        """install the RAM boost helpers (needs the password once). -> True when done"""
+        """install (or update) the RAM boost helpers (needs the password once). -> True when done"""
         err = False
+        upd = getattr(self, "boost_update", False)
+        why = ("clawputer was updated: the ram boost helpers need updating too." if upd else
+               "installs 2 small helpers so clawputer can pause background services while claude "
+               "runs (undo any time).")
         for _ in range(3):
-            pw = self.dialog("ram boost setup" if not err else "wrong password? try again",
-                             ["installs 2 small helpers so clawputer can pause background "
-                              "services while claude runs (undo any time).", "enter your password:"],
-                             password=True, err=err)
+            pw = self.dialog(("update ram boost" if upd else "ram boost setup") if not err
+                             else "wrong password? try again",
+                             [why, "enter your password:"], password=True, err=err)
             if pw is None:
                 return False
             self.splash("setting up the ram boost...")
@@ -2411,6 +2517,8 @@ class App:
             if p is not None:
                 log("boost setup", p.returncode, p.stderr.decode(errors="replace")[-300:])
             err = True
+        self.dialog("ram boost not set up", ["3 wrong passwords (or the setup failed).",
+                                             "pick 'just run it', or try again."], hint="any key", err=True)
         return False
 
     def ask_reboot_back(self):
@@ -2522,6 +2630,7 @@ class App:
             msgs = self.claude.read()
             if msgs is None:
                 self.busy = False
+                self.pending = self.ask = self.turn = None
                 self.add("err", "claude stopped. enter = restart.")
             else:
                 for m in msgs:
@@ -2611,6 +2720,29 @@ def play_chime():
                 continue
     except OSError as e:
         log("chime", e)
+
+
+def claude_email():
+    """the signed-in account's email, read from claude's own config (no extra claude process)"""
+    try:
+        with open(os.path.expanduser("~/.claude.json")) as f:
+            return ((json.load(f).get("oauthAccount") or {}).get("emailAddress")) or ""
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def boost_helpers_outdated():
+    """the installed root helpers differ from this version's (an upgrade doesn't update them)"""
+    try:
+        for name in ("clawputer-boost", "clawputer-bootmode"):
+            if not os.path.exists("/usr/local/sbin/" + name):
+                return False                 # not set up at all: that's a different question
+            with open("/usr/local/sbin/" + name, "rb") as a, open(os.path.join(SHARE, "boost", name), "rb") as b:
+                if a.read() != b.read():
+                    return True
+    except OSError:
+        pass
+    return False
 
 
 def battery():

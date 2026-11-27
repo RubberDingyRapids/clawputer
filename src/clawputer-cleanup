@@ -2,7 +2,8 @@
 # Runs after the clawputer-chat service stops, however it ended (quit, crash, killed):
 # if the ram boost is still on, put the paused background services back.
 CONF="$HOME/.config/clawputer"
-rm -f "$CONF/gui.state"
+rm -f "$CONF/gui.state" "$CONF/askpass.sock"
+sudo -k 2>/dev/null          # a password typed for claude must not outlive the chat
 if [ -e "$CONF/boost.on" ]; then
   sudo -n /usr/local/sbin/clawputer-boost off >/dev/null 2>&1
   rm -f "$CONF/boost.on"
