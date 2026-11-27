@@ -127,6 +127,7 @@ BRIGHT = (255, 255, 255)     # **bold** text
 OK = (120, 210, 130)
 MD_TOKEN = re.compile(r"(\*\*[^*\n]+\*\*|`[^`\n]+`)")
 CHIME_FILE = os.path.join(CONF, "chime.wav")
+RESULT_MAX_LINES, RESULT_MAX_CHARS = 400, 40000   # tool output kept per result (web ui can unfold it)
 
 
 def log(*a):
@@ -744,13 +745,14 @@ class App:
                 if not isinstance(c, dict):
                     continue
                 if c.get("type") == "tool_result":
+                    # keep the whole output (the web ui unfolds it); the cardputer trims it when
+                    # drawing. capped so one huge file can't eat the RAM
                     txt = result_text(c.get("content")).strip()
-                    lines = txt.splitlines() or [""]
-                    limit = len(lines) if self.cfg["tool_lines"] == "all" else int(self.cfg["tool_lines"])
-                    shown = "\n".join(lines[:limit])
-                    if len(lines) > limit:
-                        shown += "\n… +%d lines" % (len(lines) - limit)
-                    self.add("err" if c.get("is_error") else "result", shown if txt else "(no output)")
+                    lines = txt.splitlines()
+                    if len(lines) > RESULT_MAX_LINES:
+                        txt = "\n".join(lines[:RESULT_MAX_LINES]) + \
+                            "\n… +%d more lines (not kept)" % (len(lines) - RESULT_MAX_LINES)
+                    self.add("err" if c.get("is_error") else "result", txt[:RESULT_MAX_CHARS] if txt else "(no output)")
                 elif loading and c.get("type") == "text" and not c.get("text", "").lstrip().startswith("<"):
                     self.add("user", c.get("text", "").strip())
 
@@ -1541,8 +1543,6 @@ class App:
         changed = [st for st in SETTINGS if st[3] and self.cfg.get(st[0]) != self.menu_before.get(st[0])]
         if self.cfg.get("web") == "on" and self.menu_before.get("web") != "on" and not self.web:
             self.start_web()
-        if self.cfg["tool_lines"] != self.menu_before["tool_lines"]:
-            self.add("info", "  tool output: applies to new results")
         if changed:
             what = ", ".join("%s=%s" % (st[1], self.cfg[st[0]]) for st in changed)
             if self.busy:
@@ -1593,7 +1593,11 @@ class App:
         hard = lambda s, w: [s[i:i + w] for i in range(0, max(len(s), 1), w)]
         if kind in ("result", "err"):
             out.append((kind, label, "top"))
-            for raw in text.split("\n"):
+            rows = text.split("\n")
+            limit = len(rows) if self.cfg["tool_lines"] == "all" else int(self.cfg["tool_lines"])
+            if len(rows) > limit:
+                rows = rows[:limit] + ["… +%d lines" % (len(rows) - limit)]
+            for raw in rows:
                 out.extend((kind, c, "mid") for c in hard(raw, inner))
             out.append((kind, "", "bot"))
             return out

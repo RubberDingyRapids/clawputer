@@ -51,6 +51,7 @@ g.list_chats = lambda: []
 g.install_claude_md = lambda: None
 g.play_chime = lambda: chimes.append(time.time())
 g.save_settings = lambda cfg: None
+g.load_settings = lambda: dict(g.DEFAULTS)          # never your real settings (e.g. web ui on)
 g.App.open_askpass = lambda self: None
 g.App.set_state = lambda self, st: None
 g.App.save_draft = lambda self: None
@@ -159,6 +160,17 @@ save(a, "7-help.png")
 a.overlay = None
 check(any(l.startswith("/new") for l in a.show_help() or a.overlay[1]), "help: /new on its own line")
 a.overlay = None
+
+# tool output: kept whole (the web ui can unfold it), trimmed only on the cardputer screen
+a.entries.clear()
+a.cfg["tool_lines"] = "3"
+a.ingest({"type": "user", "message": {"content": [
+    {"type": "tool_result", "content": "\n".join("line %d" % i for i in range(10))}]}})
+check(a.entries[-1][1].count("\n") == 9, "full tool output kept for the web ui")
+a.lines_cache = None
+rows = [t for k, t, p in a.all_lines() if k == "result" and p == "mid"]
+check(rows[:3] == ["line 0", "line 1", "line 2"] and rows[3:] == ["… +7 lines"],
+      "cardputer shows 3 lines + '… +7 lines': %r" % rows)
 
 print("\n%d failed" % len(fails) if fails else "\nall passed")
 sys.exit(1 if fails else 0)

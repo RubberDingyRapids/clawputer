@@ -256,37 +256,48 @@ else if(/[?&]k=/.test(location.search))localStorage.removeItem('cpk')}catch(e){}
 
 PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,interactive-widget=resizes-content">
-<meta name=theme-color content="#16161d"><title>Clawputer</title>
+<meta name=theme-color content="#0c0c10"><title>Clawputer</title>
 <style>
-:root{--bg:#16161d;--panel:#1f1f29;--line:#2e2e3b;--fg:#e4e4ea;--dim:#8b8b99;--acc:#e8875b;
---user:#7fb4ff;--tool:#c7a0ff;--ok:#6fd08c;--err:#ff6b6b;--ask:#ffcf5c;--code:#a8e0b0}
+/* same colours as the cardputer screen */
+:root{--bg:#0c0c10;--panel:#17171f;--line:#23232d;--fg:#e1e1e1;--dim:#787882;--acc:#d97757;
+--user:#6ec8ff;--tool:#ebbe5a;--res:#8c8c96;--box:#4b4b5c;--ok:#78d282;--err:#ff6e6e;--ask:#ff78c8;--code:#96dc96;
+--colw:980px;--side:max(12px,calc((100% - var(--colw)) / 2))}
+@media (min-width:1500px){:root{--colw:1120px}body{font-size:16px}}
 *{box-sizing:border-box}html,body{height:100%;margin:0}
 body{background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;
 display:flex;flex-direction:column}
-header{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);
+header{display:flex;align-items:center;gap:8px;padding:8px var(--side);border-bottom:1px solid var(--line);
 background:var(--panel);position:sticky;top:0;z-index:5}
 header h1{font-size:16px;margin:0;color:var(--acc);font-weight:650}
 #status{color:var(--dim);font-size:13px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #batt{color:var(--dim);font-size:12px}
 .hb{background:none;border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:5px 9px;font-size:13px;cursor:pointer}
 .hb:hover{border-color:var(--acc)}
-main{flex:1;min-height:0;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px}
+main{flex:1;min-height:0;overflow-y:auto;padding:12px var(--side);display:flex;flex-direction:column;gap:8px}
 main>*{flex-shrink:0}
-.m{max-width:min(760px,92%);padding:8px 12px;border-radius:14px;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}
-.user{align-self:flex-end;background:#25344d;color:#dbe8ff;border-bottom-right-radius:4px}
-.assistant{align-self:flex-start;background:var(--panel);border-bottom-left-radius:4px}
-.tool{align-self:flex-start;color:var(--tool);font:13px ui-monospace,Menlo,Consolas,monospace;padding:2px 6px}
-.result,.err{align-self:flex-start;font:12.5px/1.4 ui-monospace,Menlo,Consolas,monospace;color:#c9c9d4;
-background:#101016;border:1px solid var(--line);border-left:3px solid #4a4a5c;border-radius:6px;padding:5px 9px;
-max-height:calc(8.4em + 10px);overflow:hidden;cursor:pointer}
-.result.open,.err.open{max-height:none}
-.err{color:var(--err);border-left-color:#6b2b2b}
+.m{max-width:92%;padding:8px 12px;border-radius:14px;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}
+.user{align-self:flex-end;background:#1e3448;color:#d7ebff;border-bottom-right-radius:4px}
+.assistant{align-self:stretch;max-width:100%;padding:2px 4px}
+.h{color:var(--acc)}
+/* a command and its output: one box, the command written on the top border (like the cardputer) */
+.box{align-self:stretch;min-width:0;min-inline-size:0;width:100%;margin:2px 0;border:1px solid var(--box);border-radius:4px;padding:1px 9px 5px;
+font:12.5px/1.4 ui-monospace,Menlo,Consolas,monospace;color:var(--res);--fade:var(--bg)}
+.box legend{color:var(--tool);padding:0 5px;max-width:calc(100% - 8px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.box.open legend{white-space:pre-wrap;word-break:break-all}
+.box.pend{border-color:transparent;padding:0 4px}.box.pend legend{padding:0}.box.pend legend::before{content:"▸ "}
+.box.err{border-color:#6e3c3c;color:var(--err)}
+.txt{position:relative;overflow:hidden;white-space:pre-wrap;overflow-wrap:anywhere}
+.cut{cursor:pointer}
+.cut:not(.open) .txt::after{content:"";position:absolute;left:0;right:0;bottom:0;height:1.5em;
+background:linear-gradient(rgba(0,0,0,0),var(--fade))}
+.more{font:11.5px system-ui,sans-serif;color:var(--acc);margin-top:2px;user-select:none}
+.more::before{content:"… ";color:var(--dim)}.open .more::before{content:""}
 .info,.queued{align-self:center;color:var(--dim);font-size:12.5px;padding:0 6px}
 .ask{align-self:flex-start;color:var(--ask);font-size:13px;padding:0 6px}
-pre{background:#101016;border:1px solid var(--line);border-radius:8px;padding:8px;overflow-x:auto;
+pre{background:none;border:1px solid var(--box);border-radius:4px;padding:6px 9px;overflow-x:auto;
 color:var(--code);font:12.5px ui-monospace,Menlo,Consolas,monospace;margin:6px 0;white-space:pre}
-code{background:#101016;border-radius:4px;padding:1px 4px;font:13px ui-monospace,Menlo,Consolas,monospace;color:var(--code)}
-.card{margin:0 12px 8px;padding:10px 12px;border-radius:12px;background:var(--panel);border:1px solid var(--ask)}
+code{background:#17171f;border-radius:4px;padding:1px 4px;font:13px ui-monospace,Menlo,Consolas,monospace;color:var(--code)}
+.card{margin:0 var(--side) 8px;padding:10px 12px;border-radius:12px;background:var(--panel);border:1px solid var(--ask)}
 .card h3{margin:0 0 6px;font-size:14px;color:var(--ask);font-weight:600}
 .card .cmd{font:13px ui-monospace,Menlo,Consolas,monospace;background:#101016;padding:6px 8px;border-radius:6px;
 margin-bottom:8px;white-space:pre-wrap;word-break:break-all}
@@ -295,7 +306,7 @@ margin-bottom:8px;white-space:pre-wrap;word-break:break-all}
 .b.pri{background:var(--acc);color:#111;font-weight:600}.b.ok{background:#2e5a3c}.b.no{background:#5a2e2e}
 .opt{display:block;width:100%;text-align:left;margin:4px 0}.opt small{display:block;color:var(--dim);font-size:12px}
 .opt.on{outline:2px solid var(--acc)}
-footer{padding:8px 12px 12px;border-top:1px solid var(--line);background:var(--panel);display:flex;gap:8px;align-items:flex-end}
+footer{padding:8px var(--side) 12px;border-top:1px solid var(--line);background:var(--panel);display:flex;gap:8px;align-items:flex-end}
 textarea{flex:1;resize:none;background:#15151c;color:var(--fg);border:1px solid var(--line);border-radius:12px;
 padding:9px 11px;font:15px system-ui,sans-serif;max-height:40vh;min-height:42px}
 textarea:focus,input:focus,select:focus{outline:none;border-color:var(--acc)}
@@ -303,6 +314,7 @@ input[type=password],input[type=text],select{background:#15151c;color:var(--fg);
 border-radius:10px;padding:8px 10px;font-size:15px}
 .sheet{position:fixed;inset:0;background:#000a;display:none;z-index:10;align-items:flex-end;justify-content:center}
 .sheet.show{display:flex}
+@media (min-width:900px){.sheet{align-items:center}.sheet>div{border-radius:16px}}
 .sheet>div{background:var(--panel);width:min(560px,100%);max-height:85vh;overflow-y:auto;border-radius:16px 16px 0 0;padding:14px}
 .sheet h2{margin:0 0 10px;font-size:17px;color:var(--acc)}
 .li{display:flex;justify-content:space-between;gap:10px;padding:10px;border-radius:10px;cursor:pointer;border-bottom:1px solid var(--line)}
@@ -312,7 +324,7 @@ border-radius:10px;padding:8px 10px;font-size:15px}
 #screen img{width:100%;image-rendering:pixelated;border-radius:8px;border:1px solid var(--line);background:#000}
 .keys{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:10px}
 .keys .b{padding:10px 0}
-#live{display:none;padding:4px 14px 6px;color:var(--acc);font-size:13.5px}
+#live{display:none;padding:4px var(--side) 6px;color:var(--acc);font-size:13.5px}
 #live .g{display:inline-block;width:1.1em}#live .d{color:var(--dim)}
 #spin{display:none;width:9px;height:9px;border-radius:50%;background:var(--acc);animation:p 1s infinite}
 @keyframes p{50%{opacity:.25}}
@@ -357,14 +369,36 @@ function md(t){
   parts.forEach((p,i)=>{
     if(i%2){p=p.replace(/^[\w+-]*\n/,'');out+='<pre>'+esc(p.replace(/\n$/,''))+'</pre>'}
     else out+=esc(p).replace(/`([^`\n]+)`/g,'<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g,'<b>$1</b>')
-      .replace(/^#{1,4} (.*)$/gm,'<b>$1</b>');
+      .replace(/^#{1,4} (.*)$/gm,'<b class=h>$1</b>');
   });return out}
 function add(kind,text){
+  if(kind=='tool'){                                  // waits for its output, then becomes the box label
+    const d=document.createElement('fieldset');d.className='box pend';
+    const l=document.createElement('legend');l.textContent=text.replace(/^▸ /,'');d.appendChild(l);
+    log.appendChild(d);return}
+  if(kind=='result'||kind=='err'){
+    let d=log.lastElementChild;
+    if(!(d&&d.classList.contains('pend'))){d=document.createElement('fieldset');d.className='box';log.appendChild(d)}
+    d.classList.remove('pend');if(kind=='err')d.classList.add('err');
+    const t=document.createElement('div');t.className='txt';t.textContent=text;d.appendChild(t);
+    clip(d,t);return}
   const d=document.createElement('div');d.className='m '+kind;
   if(kind=='ask')text=text.split('\n')[0];
   if(kind=='assistant')d.innerHTML=md(text);else d.textContent=text;
-  if(kind=='result'||kind=='err')d.onclick=()=>d.classList.toggle('open');
   log.appendChild(d)}
+// output boxes start folded to the same number of lines as the cardputer (tool output setting),
+// with the command cut to one line: "▸ N more lines" / "▸ full command" unfolds it
+function clip(d,t){
+  const lim=(S.cfg&&S.cfg.tool_lines)||'3',base=lim=='all'?'none':(lim*1.4)+'em';
+  t.style.maxHeight=base;
+  const l=d.querySelector('legend'),longCmd=l&&l.scrollWidth>l.clientWidth+1,over=t.scrollHeight>t.clientHeight+2;
+  if(!longCmd&&!over)return;
+  const lh=parseFloat(getComputedStyle(t).lineHeight)||16;
+  const n=over?Math.max(1,Math.round((t.scrollHeight-t.clientHeight)/lh)):0;
+  const m=document.createElement('div');m.className='more';d.appendChild(m);d.classList.add('cut');
+  const label=()=>{m.textContent=d.classList.contains('open')?'▾ show less':(n?'▸ '+n+' more line'+(n>1?'s':''):'▸ full command')};
+  label();d.onclick=()=>{if(getSelection().toString())return;
+    const o=d.classList.toggle('open');t.style.maxHeight=o?'none':base;label()}}
 async function act(o){
   try{const r=await fetch('/api/act',{method:'POST',headers:{...H,'X-CP':'1','Content-Type':'application/json'},body:JSON.stringify(o)});
     if(r.status==401)location.reload()}catch(e){}}
